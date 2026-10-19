@@ -1501,7 +1501,9 @@ func (s *Server) handleData(w http.ResponseWriter, r *http.Request) {
 	go func() {
 		defer func() { close(done) }()
 		for data := range dataCh {
+			log.Printf("data: sending %d bytes to client", len(data))
 			if err := conn.WriteMessage(websocket.BinaryMessage, data); err != nil {
+				log.Printf("data: write to client error: %v", err)
 				return
 			}
 		}
@@ -1512,10 +1514,13 @@ func (s *Server) handleData(w http.ResponseWriter, r *http.Request) {
 		for {
 			_, msg, err := conn.ReadMessage()
 			if err != nil {
+				log.Printf("data: client read error: %v", err)
 				return
 			}
+			log.Printf("data: received %d bytes from client: %q", len(msg), string(msg)[:min(50, len(msg))])
 			if block.ptmx != nil && len(msg) > 0 {
-				block.ptmx.Write(msg)
+				n, err := block.ptmx.Write(msg)
+				log.Printf("data: wrote %d bytes to PTY (err=%v)", n, err)
 			}
 		}
 	}()
