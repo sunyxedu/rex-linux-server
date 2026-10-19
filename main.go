@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"os/user"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -423,6 +424,44 @@ func (s *Server) handleMethod(req RequestMsg, client *Client) (interface{}, *Rex
 		return s.targetResolve(req)
 	case "target.complete":
 		return map[string]interface{}{"completions": []interface{}{}}, nil
+	case "block.event":
+		return map[string]interface{}{}, nil
+	case "session.new_block":
+		return s.sessionNewBlock(req, client)
+	case "session.move_block":
+		return s.revisionResponse(req), nil
+	case "session.detach_block":
+		return s.revisionResponse(req), nil
+	case "session.float_block":
+		return s.revisionResponse(req), nil
+	case "session.close_layer":
+		return s.revisionResponse(req), nil
+	case "session.new_layer":
+		return s.revisionResponse(req), nil
+	case "session.raise_layer":
+		return s.revisionResponse(req), nil
+	case "session.lower_layer":
+		return s.revisionResponse(req), nil
+	case "session.resize_layer":
+		return s.revisionResponse(req), nil
+	case "session.focus_direction":
+		return s.revisionResponse(req), nil
+	case "session.focus_next_pane":
+		return s.revisionResponse(req), nil
+	case "session.focus_previous_pane":
+		return s.revisionResponse(req), nil
+	case "client.action":
+		return map[string]interface{}{}, nil
+	case "client.key":
+		return map[string]interface{}{}, nil
+	case "client.perform":
+		return map[string]interface{}{}, nil
+	case "client.reply":
+		return map[string]interface{}{}, nil
+	case "server.tailscale.enable", "server.tailscale.disable", "server.tailscale.login", "server.tailscale.logout", "server.tailscale.rename":
+		return map[string]interface{}{}, nil
+	case "server.apple.grant_file_access":
+		return map[string]interface{}{}, nil
 	case "help.all":
 		return s.helpAll(), nil
 	default:
@@ -1089,6 +1128,19 @@ func (s *Server) blockMethod(req RequestMsg, client *Client) (interface{}, *RexA
 	}
 
 	fullMethod := params.Method
+	// Rex.app may send short method names (e.g. "process") or full names
+	// (e.g. "com.superlogical.terminal.process"). Normalize to full name.
+	shortMethod := fullMethod
+	if !strings.Contains(fullMethod, ".") {
+		fullMethod = "com.superlogical.terminal." + fullMethod
+	} else {
+		// Extract short name after last dot
+		idx := strings.LastIndex(fullMethod, ".")
+		if idx >= 0 {
+			shortMethod = fullMethod[idx+1:]
+		}
+	}
+	_ = shortMethod
 
 	switch fullMethod {
 	case "com.superlogical.terminal.resize":
@@ -1294,14 +1346,11 @@ func (s *Server) dataConnect(req RequestMsg, client *Client) (interface{}, *RexA
 	s.tickets[ticketKey] = dt
 	s.mu.Unlock()
 
-	// Return ticket as byte array
-	ticketBytes := make([]int, 16)
-	for i, b := range ticket {
-		ticketBytes[i] = int(b)
-	}
+	// Return ticket as base64url string (no padding), matching real Rex server
+	ticketStr := base64.RawURLEncoding.EncodeToString(ticket[:])
 
 	return map[string]interface{}{
-		"ticket":        ticketBytes,
+		"ticket":        ticketStr,
 		"expires_in_ms": 60000,
 	}, nil
 }
@@ -1568,22 +1617,79 @@ func (s *Server) sessionOwnBlock(req RequestMsg, client *Client) (interface{}, *
 	var params struct {
 		SessionID string   `json:"session_id"`
 		BlockIDs  []string `json:"block_ids"`
+		Mode      string   `json:"mode"`
+	}
+	if req.Payload != nil {
+		json.Unmarshal(req.Payload, &params)
+	}
+
+	var result []map[string]interface{}
+
+	s.mu.Lock()
+	if sess, ok := s.sessions[params.SessionID]; ok {
+		blockIDs := params.BlockIDs
+		if len(blockIDs) == 0 {
+			// Claim all blocks in the session
+			for bid := range sess.Blocks {
+				blockIDs = append(blockIDs, bid)
+			}
+		}
+		for _, bid := range blockIDs {
+			if b, ok := sess.Blocks[bid]; ok {
+				mode := params.Mode
+				if mode == "" {
+					mode = "take"
+				}
+				if mode == "take" || (mode == "request" && b.Owner == "") {
+					b.Owner = client.ID
+				}
+				entry := map[string]interface{}{
+					"block_id": bid,
+				}
+				if b.Owner != "" {
+					entry["owner"] = b.Owner
+				}
+				result = append(result, entry)
+			}
+		}
+	}
+	s.mu.Unlock()
+
+	if result == nil {
+		result = []map[string]interface{}{}
+	}
+
+	return map[string]interface{}{"blocks": result}, nil
+}
+
+func (s *Server) sessionNewBlock(req RequestMsg, client *Client) (interface{}, *RexAPIError) {
+	var params struct {
+		SessionID string                 `json:"session_id"`
+		Creator   string                 `json:"creator"`
+		Flavor    string                 `json:"flavor"`
+		Label     string                 `json:"label"`
+		Options   map[string]interface{} `json:"options"`
 	}
 	if req.Payload != nil {
 		json.Unmarshal(req.Payload, &params)
 	}
 
 	s.mu.Lock()
-	if sess, ok := s.sessions[params.SessionID]; ok {
-		for _, bid := range params.BlockIDs {
-			if b, ok := sess.Blocks[bid]; ok {
-				b.Owner = client.ID
-			}
-		}
+	sess, ok := s.sessions[params.SessionID]
+	if !ok {
+		s.mu.Unlock()
+		return nil, &RexAPIError{Status: 404, Code: "not_found", Message: "session not found"}
 	}
+
+	block := s.createTerminalBlock(params.SessionID, client.ID)
+	sess.revision++
+	rev := sess.revision
 	s.mu.Unlock()
 
-	return map[string]interface{}{}, nil
+	return map[string]interface{}{
+		"block_id": block.ID,
+		"revision": rev,
+	}, nil
 }
 
 func (s *Server) sessionListBlocks(req RequestMsg) (interface{}, *RexAPIError) {
@@ -1645,9 +1751,140 @@ func (s *Server) revisionResponse(req RequestMsg) interface{} {
 }
 
 func (s *Server) targetResolve(req RequestMsg) (interface{}, *RexAPIError) {
-	return map[string]interface{}{
-		"resources": []interface{}{},
-	}, nil
+	var params struct {
+		Queries []string `json:"queries"`
+		Kinds   []string `json:"kinds"`
+		Context struct {
+			SessionID string `json:"session_id"`
+			BlockID   string `json:"block_id"`
+		} `json:"context"`
+		Scope struct {
+			Session string `json:"session"`
+			Window  string `json:"window"`
+		} `json:"scope"`
+	}
+	if req.Payload != nil {
+		json.Unmarshal(req.Payload, &params)
+	}
+
+	var results []interface{}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	for _, query := range params.Queries {
+		resolved := false
+		for _, kind := range params.Kinds {
+			switch kind {
+			case "session":
+				for _, sess := range s.sessions {
+					if query == "" || query == sess.ID || query == sess.Label || matchesSuffix(sess.ID, query) {
+						results = append(results, map[string]interface{}{
+							"query":  query,
+							"status": "resolved",
+							"target": map[string]interface{}{
+								"kind":       "session",
+								"session_id": sess.ID,
+								"label":      sess.Label,
+								"where":      sess.Label,
+							},
+						})
+						resolved = true
+						break
+					}
+				}
+			case "window":
+				for _, sess := range s.sessions {
+					if params.Context.SessionID != "" && sess.ID != params.Context.SessionID {
+						continue
+					}
+					for i, win := range sess.Windows {
+						if query == "" || query == win.ID || query == win.Label || matchesSuffix(win.ID, query) {
+							results = append(results, map[string]interface{}{
+								"query":  query,
+								"status": "resolved",
+								"target": map[string]interface{}{
+									"kind":       "window",
+									"session_id": sess.ID,
+									"window_id":  win.ID,
+									"label":      win.Label,
+									"where":      fmt.Sprintf("window %d", i+1),
+									"ordinal":    i + 1,
+								},
+							})
+							resolved = true
+							break
+						}
+					}
+					if resolved {
+						break
+					}
+				}
+			case "block":
+				for _, sess := range s.sessions {
+					if params.Context.SessionID != "" && sess.ID != params.Context.SessionID {
+						continue
+					}
+					for _, block := range sess.Blocks {
+						if query == "" || query == block.ID || query == block.Label || matchesSuffix(block.ID, query) {
+							// Find which window contains this block
+							winID := ""
+							where := "detached"
+							for wi, win := range sess.Windows {
+								for _, layer := range win.Layers {
+									for _, lb := range layer.Blocks {
+										if lb.BlockID == block.ID {
+											winID = win.ID
+											where = fmt.Sprintf("window %d", wi+1)
+										}
+									}
+								}
+							}
+							results = append(results, map[string]interface{}{
+								"query":  query,
+								"status": "resolved",
+								"target": map[string]interface{}{
+									"kind":       "block",
+									"session_id": sess.ID,
+									"window_id":  winID,
+									"block_id":   block.ID,
+									"label":      block.Label,
+									"where":      where,
+								},
+							})
+							resolved = true
+							break
+						}
+					}
+					if resolved {
+						break
+					}
+				}
+			}
+			if resolved {
+				break
+			}
+		}
+		if !resolved {
+			results = append(results, map[string]interface{}{
+				"query":  query,
+				"status": "not_found",
+			})
+		}
+	}
+
+	if results == nil {
+		results = []interface{}{}
+	}
+
+	return map[string]interface{}{"results": results}, nil
+}
+
+func matchesSuffix(id, query string) bool {
+	if len(query) < 4 || len(query) > 32 {
+		return false
+	}
+	return len(id) >= len(query) && id[len(id)-len(query):] == query
 }
 
 func (s *Server) helpAll() interface{} {
