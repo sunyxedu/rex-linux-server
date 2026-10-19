@@ -1488,6 +1488,17 @@ func (s *Server) handleData(w http.ResponseWriter, r *http.Request) {
 	block.dataSubs[subID] = dataCh
 	block.mu.Unlock()
 
+	// Nudge the shell to redraw its prompt by sending a newline.
+	// The shell's initial prompt was consumed before any data client subscribed.
+	if block.ptmx != nil {
+		// Send SIGWINCH via pty resize to trigger prompt redraw without executing anything
+		if block.cols > 0 && block.rows > 0 {
+			pty.Setsize(block.ptmx, &pty.Winsize{Rows: uint16(block.rows), Cols: uint16(block.cols)})
+		}
+		// Also write an empty line to get a fresh prompt
+		block.ptmx.Write([]byte("\n"))
+	}
+
 	defer func() {
 		block.mu.Lock()
 		delete(block.dataSubs, subID)
