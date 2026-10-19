@@ -195,6 +195,33 @@ func NewServer() *Server {
 	}
 }
 
+// broadcastEvent sends an event to all connected clients
+func (s *Server) broadcastEvent(event interface{}) {
+	seq := s.nextSeq()
+	msg := EventMsg{
+		Type:    "event",
+		Seq:     seq,
+		Payload: event,
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, c := range s.clients {
+		if c.conn != nil {
+			c.conn.WriteJSON(msg)
+		}
+	}
+}
+
+func (s *Server) broadcastSessionEvent(sessionID string, event interface{}) {
+	s.broadcastEvent(map[string]interface{}{
+		"type": "session_event",
+		"payload": map[string]interface{}{
+			"session_id": sessionID,
+			"event":      event,
+		},
+	})
+}
+
 func (s *Server) nextSeq() int64 {
 	return s.seqGen.Add(1)
 }
@@ -311,10 +338,15 @@ func (s *Server) handleControl(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		log.Printf("request: %s %s", req.ID, req.Method)
+		if req.Method == "block.method" || req.Method == "session.own_block" || req.Method == "data.connect" {
+			log.Printf("request: %s %s payload=%s", req.ID, req.Method, string(req.Payload))
+		} else {
+			log.Printf("request: %s %s", req.ID, req.Method)
+		}
 
 		result, apiErr := s.handleMethod(req, client)
 		if apiErr != nil {
+			log.Printf("  -> ERROR %d %s: %s", apiErr.Status, apiErr.Code, apiErr.Message)
 			resp := ErrorResponseMsg{
 				Type:  "response",
 				ID:    req.ID,
@@ -323,6 +355,14 @@ func (s *Server) handleControl(w http.ResponseWriter, r *http.Request) {
 			}
 			conn.WriteJSON(resp)
 		} else {
+			// Log response payload for debugging (truncated)
+			if respBytes, err := json.Marshal(result); err == nil {
+				s := string(respBytes)
+				if len(s) > 300 {
+					s = s[:300] + "..."
+				}
+				log.Printf("  -> OK: %s", s)
+			}
 			resp := ResponseMsg{
 				Type:    "response",
 				ID:      req.ID,
@@ -1381,7 +1421,7 @@ func (s *Server) handleData(w http.ResponseWriter, r *http.Request) {
 	if len(msg) < 17 {
 		log.Printf("data: hello too short: %d bytes", len(msg))
 		// Send REJECT
-		conn.WriteMessage(websocket.BinaryMessage, []byte{0x01, 0x01}) // REJECT
+		conn.WriteMessage(websocket.BinaryMessage, []byte{0x82, 0x01}) // REJECT
 		return
 	}
 
@@ -1401,7 +1441,7 @@ func (s *Server) handleData(w http.ResponseWriter, r *http.Request) {
 
 	if !ok || time.Now().After(dt.ExpiresAt) {
 		log.Printf("data: invalid or expired ticket")
-		conn.WriteMessage(websocket.BinaryMessage, []byte{0x01, 0x02}) // REJECT - bad ticket
+		conn.WriteMessage(websocket.BinaryMessage, []byte{0x82, 0x02}) // REJECT - bad ticket
 		return
 	}
 
@@ -1412,18 +1452,29 @@ func (s *Server) handleData(w http.ResponseWriter, r *http.Request) {
 	sess, ok := s.sessions[dt.SessionID]
 	if !ok {
 		s.mu.RUnlock()
-		conn.WriteMessage(websocket.BinaryMessage, []byte{0x01, 0x03})
+		conn.WriteMessage(websocket.BinaryMessage, []byte{0x82, 0x03})
 		return
 	}
 	block, ok := sess.Blocks[dt.BlockID]
 	s.mu.RUnlock()
 	if !ok {
-		conn.WriteMessage(websocket.BinaryMessage, []byte{0x01, 0x03})
+		conn.WriteMessage(websocket.BinaryMessage, []byte{0x82, 0x03})
 		return
 	}
 
-	// Send WELCOME (single byte 0x00)
-	if err := conn.WriteMessage(websocket.BinaryMessage, []byte{0x00}); err != nil {
+	// Send WELCOME: opcode(1) + reconnect_token(16) + reserved(4) + timeout_ms_le(4) + extra(8)
+	// Opcode 0x81 = WELCOME, 0x82 = REJECT
+	welcomeData := make([]byte, 32)
+	welcomeData[0] = 0x81 // WELCOME opcode
+	rand.Read(welcomeData[1:17]) // reconnect token
+	// bytes 17-20: reserved/zero
+	// bytes 21-24: timeout in ms, little-endian uint32 (60000 = 0xEA60)
+	welcomeData[21] = 0x60
+	welcomeData[22] = 0xEA
+	welcomeData[23] = 0x00
+	welcomeData[24] = 0x00
+	rand.Read(welcomeData[25:32]) // extra token data
+	if err := conn.WriteMessage(websocket.BinaryMessage, welcomeData); err != nil {
 		log.Printf("data: writing welcome: %v", err)
 		return
 	}
@@ -1624,12 +1675,13 @@ func (s *Server) sessionOwnBlock(req RequestMsg, client *Client) (interface{}, *
 	}
 
 	var result []map[string]interface{}
+	var ownerChanges []map[string]interface{}
 
 	s.mu.Lock()
+	sessionID := params.SessionID
 	if sess, ok := s.sessions[params.SessionID]; ok {
 		blockIDs := params.BlockIDs
 		if len(blockIDs) == 0 {
-			// Claim all blocks in the session
 			for bid := range sess.Blocks {
 				blockIDs = append(blockIDs, bid)
 			}
@@ -1640,6 +1692,7 @@ func (s *Server) sessionOwnBlock(req RequestMsg, client *Client) (interface{}, *
 				if mode == "" {
 					mode = "take"
 				}
+				oldOwner := b.Owner
 				if mode == "take" || (mode == "request" && b.Owner == "") {
 					b.Owner = client.ID
 				}
@@ -1650,10 +1703,25 @@ func (s *Server) sessionOwnBlock(req RequestMsg, client *Client) (interface{}, *
 					entry["owner"] = b.Owner
 				}
 				result = append(result, entry)
+				if b.Owner != oldOwner {
+					ownerChanges = append(ownerChanges, map[string]interface{}{
+						"block_id":       bid,
+						"owner":          b.Owner,
+						"previous_owner": oldOwner,
+					})
+				}
 			}
 		}
 	}
 	s.mu.Unlock()
+
+	// Emit block_owner_changed events
+	for _, change := range ownerChanges {
+		s.broadcastSessionEvent(sessionID, map[string]interface{}{
+			"type":    "block_owner_changed",
+			"payload": change,
+		})
+	}
 
 	if result == nil {
 		result = []map[string]interface{}{}
