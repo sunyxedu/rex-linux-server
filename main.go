@@ -197,6 +197,14 @@ type Client struct {
 	Version   string
 	AttachedSessions map[string]bool
 	conn      *websocket.Conn
+	writeMu   sync.Mutex // protects concurrent writes to conn
+}
+
+// writeJSON serializes writes to the WebSocket connection
+func (c *Client) writeJSON(v interface{}) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	return c.conn.WriteJSON(v)
 }
 
 type DataTicket struct {
@@ -228,7 +236,7 @@ func (s *Server) broadcastEvent(event interface{}) {
 	defer s.mu.RUnlock()
 	for _, c := range s.clients {
 		if c.conn != nil {
-			c.conn.WriteJSON(msg)
+			c.writeJSON(msg)
 		}
 	}
 }
@@ -329,41 +337,16 @@ func (s *Server) handleControl(w http.ResponseWriter, r *http.Request) {
 			ReconnectToken: randomToken(),
 		},
 	}
-	if err := conn.WriteJSON(welcome); err != nil {
+	if err := client.writeJSON(welcome); err != nil {
 		log.Printf("writing welcome: %v", err)
 		return
 	}
 
 	log.Printf("client connected: %s (%s/%s)", clientID, hello.Client.Name, hello.Client.Platform)
 
-	// Send client_connected events to all sessions (like the real Rex server does)
-	// This must happen BEFORE the bootstrap response to match real Rex behavior.
-	s.mu.RLock()
-	for _, sess := range s.sessions {
-		seq := s.nextSeq()
-		conn.WriteJSON(EventMsg{
-			Type: "event",
-			Seq:  seq,
-			Payload: map[string]interface{}{
-				"type": "session_event",
-				"payload": map[string]interface{}{
-					"session_id": sess.ID,
-					"event": map[string]interface{}{
-						"type": "client_connected",
-						"payload": map[string]interface{}{
-							"client_id": clientID,
-							"principal": map[string]interface{}{
-								"kind":      "peer",
-								"transport": "tailscale",
-								"display":   "hemlix",
-							},
-						},
-					},
-				},
-			},
-		})
-	}
-	s.mu.RUnlock()
+	// Note: client_connected events are sent only when bootstrap is called,
+	// not on initial connection. Sending events before bootstrap confuses
+	// CLI clients that don't expect events before their first request.
 
 	// Step 3: Process requests
 	for {
@@ -403,7 +386,7 @@ func (s *Server) handleControl(w http.ResponseWriter, r *http.Request) {
 				Seq:   0,
 				Error: apiErr,
 			}
-			conn.WriteJSON(resp)
+			client.writeJSON(resp)
 		} else {
 			// Log response payload for debugging (truncated)
 			if respBytes, err := json.Marshal(result); err == nil {
@@ -419,7 +402,7 @@ func (s *Server) handleControl(w http.ResponseWriter, r *http.Request) {
 				Seq:     0,
 				Payload: result,
 			}
-			conn.WriteJSON(resp)
+			client.writeJSON(resp)
 		}
 	}
 }
@@ -704,60 +687,29 @@ func (s *Server) sessionAttach(req RequestMsg, client *Client) (interface{}, *Re
 
 	client.AttachedSessions[params.SessionID] = true
 
-	// After attach, send proactive events to signal terminal readiness.
-	// Rex.app may wait for these before opening the data channel.
-	go func() {
-		time.Sleep(50 * time.Millisecond)
-		for _, block := range sess.Blocks {
-			// size_changed event
-			s.broadcastSessionEvent(params.SessionID, map[string]interface{}{
-				"type": "block_event",
-				"payload": map[string]interface{}{
-					"block_id":     block.ID,
-					"creator_name": "com.superlogical.terminal",
-					"name":         "size_changed",
+	// Send client_connected event BEFORE the response (matching real Rex server).
+	// The CLI may extract client_id from this event.
+	client.writeJSON(EventMsg{
+		Type: "event",
+		Seq:  s.nextSeq(),
+		Payload: map[string]interface{}{
+			"type": "session_event",
+			"payload": map[string]interface{}{
+				"session_id": params.SessionID,
+				"event": map[string]interface{}{
+					"type": "client_connected",
 					"payload": map[string]interface{}{
-						"columns":       block.cols,
-						"rows":          block.rows,
-						"cell_width_px": 8,
-						"cell_height_px": 16,
-						"owner":         map[string]interface{}{},
-					},
-				},
-			})
-			// process_changed event
-			if block.cmd != nil && block.cmd.Process != nil {
-				s.broadcastSessionEvent(params.SessionID, map[string]interface{}{
-					"type": "block_event",
-					"payload": map[string]interface{}{
-						"block_id":     block.ID,
-						"creator_name": "com.superlogical.terminal",
-						"name":         "process_changed",
-						"payload": map[string]interface{}{
-							"generation": 1,
-							"foreground": map[string]interface{}{
-								"pid":     block.cmd.Process.Pid,
-								"user_id": os.Getuid(),
-								"name":    "bash",
-							},
+						"client_id": client.ID,
+						"principal": map[string]interface{}{
+							"kind":      "peer",
+							"transport": "tailscale",
+							"display":   "hemlix",
 						},
 					},
-				})
-			}
-			// title_changed event
-			s.broadcastSessionEvent(params.SessionID, map[string]interface{}{
-				"type": "block_event",
-				"payload": map[string]interface{}{
-					"block_id":     block.ID,
-					"creator_name": "com.superlogical.terminal",
-					"name":         "title_changed",
-					"payload": map[string]interface{}{
-						"title": "bash",
-					},
 				},
-			})
-		}
-	}()
+			},
+		},
+	})
 
 	return map[string]interface{}{
 		"client_id": client.ID,
@@ -1598,8 +1550,7 @@ func (s *Server) handleData(w http.ResponseWriter, r *http.Request) {
 	rand.Read(welcomeData[25:32]) // extra token data — this is also the APC ID
 
 	// Extract APC ID: last 8 bytes of WELCOME as little-endian uint64
-	apcIDBytes := welcomeData[25:33]
-	if len(apcIDBytes) < 8 { apcIDBytes = welcomeData[24:32] }
+	// APC ID is bytes 24-31 of WELCOME (last 8 bytes) as LE uint64
 	apcIDVal := binary.LittleEndian.Uint64(welcomeData[24:32])
 	block.mu.Lock()
 	block.apcID = fmt.Sprintf("%d", apcIDVal)
