@@ -1356,7 +1356,14 @@ func (s *Server) blockMethod(req RequestMsg, client *Client) (interface{}, *RexA
 		}, nil
 
 	case "com.superlogical.terminal.format":
-		return map[string]interface{}{"content": ""}, nil
+		var fmtArgs struct {
+			Format string `json:"format"`
+			Trim   bool   `json:"trim"`
+		}
+		if params.Args != nil { json.Unmarshal(params.Args, &fmtArgs) }
+		content := ""
+		if block.vt != nil { content = block.vt.Format(fmtArgs.Format, fmtArgs.Trim) }
+		return map[string]interface{}{"content": content}, nil
 
 	case "com.superlogical.terminal.reset":
 		return map[string]interface{}{}, nil
@@ -2180,6 +2187,14 @@ func (s *Server) clientKey(req RequestMsg, client *Client) (interface{}, *RexAPI
 		return map[string]interface{}{"handled": false}, nil
 	}
 
+	mods := params.Key.Mods
+
+	// Super (Cmd) keys are CLIENT-SIDE shortcuts (copy, paste, new tab, etc.)
+	// Do NOT send to PTY - return handled:false so Rex.app handles them.
+	if strings.Contains(mods, "super") {
+		return map[string]interface{}{"handled": false}, nil
+	}
+
 	// Find the target block
 	s.mu.RLock()
 	sess, ok := s.sessions[params.SessionID]
@@ -2187,11 +2202,8 @@ func (s *Server) clientKey(req RequestMsg, client *Client) (interface{}, *RexAPI
 		s.mu.RUnlock()
 		return map[string]interface{}{"handled": false}, nil
 	}
-	
-	// Find target block - use block_id if provided, otherwise focused block
 	blockID := params.BlockID
 	if blockID == "" {
-		// Find the focused block in the active window
 		for _, win := range sess.Windows {
 			if win.FocusedBlockID != "" {
 				blockID = win.FocusedBlockID
@@ -2199,91 +2211,79 @@ func (s *Server) clientKey(req RequestMsg, client *Client) (interface{}, *RexAPI
 			}
 		}
 	}
-	
 	block, ok := sess.Blocks[blockID]
 	s.mu.RUnlock()
 	if !ok || block.ptmx == nil {
 		return map[string]interface{}{"handled": false}, nil
 	}
 
-	// Determine what to write to the PTY
 	var data []byte
-	
-	if params.Key.Text != "" {
-		// Has text content - write it directly
+	hasCtrl := strings.Contains(mods, "ctrl")
+	hasAlt := strings.Contains(mods, "alt")
+
+	// Handle Ctrl+key combinations FIRST (before checking text)
+	if hasCtrl {
+		// Use unshifted_codepoint for ctrl mapping (works even when text is empty)
+		cp := params.Key.UnshiftedCodepoint
+		if cp >= 97 && cp <= 122 { // a-z
+			data = []byte{byte(cp - 96)} // ctrl+a=1, ctrl+c=3, ctrl+z=26
+		} else if cp >= 65 && cp <= 90 { // A-Z
+			data = []byte{byte(cp - 64)}
+		} else {
+			switch params.Key.Key {
+			case "bracket_left":  data = []byte{0x1b} // ctrl+[ = ESC
+			case "bracket_right": data = []byte{0x1d} // ctrl+]
+			case "backslash":     data = []byte{0x1c} // ctrl+\  
+			case "slash":         data = []byte{0x1f} // ctrl+/
+			case "digit_2", "space": data = []byte{0x00} // ctrl+space/ctrl+2 = NUL
+			}
+		}
+	} else if hasAlt {
+		// Alt+key sends ESC prefix + character
+		if params.Key.Text != "" {
+			data = append([]byte{0x1b}, []byte(params.Key.Text)...)
+		} else if params.Key.UnshiftedCodepoint > 0 && params.Key.UnshiftedCodepoint < 128 {
+			data = []byte{0x1b, byte(params.Key.UnshiftedCodepoint)}
+		}
+	} else if params.Key.Text != "" {
+		// Normal text input
 		data = []byte(params.Key.Text)
 	} else {
-		// Special keys without text - map to escape sequences
+		// Special keys without text
 		switch params.Key.Key {
-		case "enter":
-			data = []byte("\r")
-		case "backspace":
-			data = []byte{0x7f}
-		case "tab":
-			data = []byte("\t")
-		case "escape":
-			data = []byte{0x1b}
-		case "arrow_up":
-			data = []byte("\x1b[A")
-		case "arrow_down":
-			data = []byte("\x1b[B")
-		case "arrow_right":
-			data = []byte("\x1b[C")
-		case "arrow_left":
-			data = []byte("\x1b[D")
-		case "home":
-			data = []byte("\x1b[H")
-		case "end":
-			data = []byte("\x1b[F")
-		case "page_up":
-			data = []byte("\x1b[5~")
-		case "page_down":
-			data = []byte("\x1b[6~")
-		case "delete":
-			data = []byte("\x1b[3~")
-		case "insert":
-			data = []byte("\x1b[2~")
-		case "f1":
-			data = []byte("\x1bOP")
-		case "f2":
-			data = []byte("\x1bOQ")
-		case "f3":
-			data = []byte("\x1bOR")
-		case "f4":
-			data = []byte("\x1bOS")
-		case "f5":
-			data = []byte("\x1b[15~")
-		case "f6":
-			data = []byte("\x1b[17~")
-		case "f7":
-			data = []byte("\x1b[18~")
-		case "f8":
-			data = []byte("\x1b[19~")
-		case "f9":
-			data = []byte("\x1b[20~")
-		case "f10":
-			data = []byte("\x1b[21~")
-		case "f11":
-			data = []byte("\x1b[23~")
-		case "f12":
-			data = []byte("\x1b[24~")
-		}
-	}
-
-	// Handle ctrl modifier
-	if len(data) == 1 && strings.Contains(params.Key.Mods, "ctrl") {
-		ch := data[0]
-		if ch >= 'a' && ch <= 'z' {
-			data = []byte{ch - 'a' + 1} // ctrl+a = 0x01, ctrl+c = 0x03, etc
-		} else if ch >= 'A' && ch <= 'Z' {
-			data = []byte{ch - 'A' + 1}
+		case "enter":      data = []byte("\r")
+		case "backspace":  data = []byte{0x7f}
+		case "tab":        data = []byte("\t")
+		case "escape":     data = []byte{0x1b}
+		case "arrow_up":   data = []byte("\x1b[A")
+		case "arrow_down": data = []byte("\x1b[B")
+		case "arrow_right":data = []byte("\x1b[C")
+		case "arrow_left": data = []byte("\x1b[D")
+		case "home":       data = []byte("\x1b[H")
+		case "end":        data = []byte("\x1b[F")
+		case "page_up":    data = []byte("\x1b[5~")
+		case "page_down":  data = []byte("\x1b[6~")
+		case "delete":     data = []byte("\x1b[3~")
+		case "insert":     data = []byte("\x1b[2~")
+		case "f1":  data = []byte("\x1bOP")
+		case "f2":  data = []byte("\x1bOQ")
+		case "f3":  data = []byte("\x1bOR")
+		case "f4":  data = []byte("\x1bOS")
+		case "f5":  data = []byte("\x1b[15~")
+		case "f6":  data = []byte("\x1b[17~")
+		case "f7":  data = []byte("\x1b[18~")
+		case "f8":  data = []byte("\x1b[19~")
+		case "f9":  data = []byte("\x1b[20~")
+		case "f10": data = []byte("\x1b[21~")
+		case "f11": data = []byte("\x1b[23~")
+		case "f12": data = []byte("\x1b[24~")
 		}
 	}
 
 	if len(data) > 0 {
 		block.ptmx.Write(data)
 	}
-	
+
 	return map[string]interface{}{"handled": false}, nil
 }
 

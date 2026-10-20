@@ -87,3 +87,48 @@ func (t *GhosttyTerminal) Free() {
 		t.term = nil
 	}
 }
+
+func (t *GhosttyTerminal) Format(format string, trim bool) string {
+	if t.term == nil {
+		return ""
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	var emit C.GhosttyFormatterFormat
+	switch format {
+	case "text":
+		emit = C.GHOSTTY_FORMATTER_FORMAT_PLAIN
+	case "vt":
+		emit = C.GHOSTTY_FORMATTER_FORMAT_VT
+	case "html":
+		emit = C.GHOSTTY_FORMATTER_FORMAT_HTML
+	default:
+		emit = C.GHOSTTY_FORMATTER_FORMAT_PLAIN
+	}
+
+	opts := C.GhosttyFormatterTerminalOptions{
+		size:   C.size_t(unsafe.Sizeof(C.GhosttyFormatterTerminalOptions{})),
+		emit:   emit,
+		trim:   C.bool(trim),
+	}
+
+	var formatter C.GhosttyFormatter
+	result := C.ghostty_formatter_terminal_new(nil, &formatter, t.term, opts)
+	if result != C.GHOSTTY_SUCCESS {
+		return ""
+	}
+	defer C.ghostty_formatter_free(formatter)
+
+	var buf *C.uint8_t
+	var bufLen C.size_t
+	result = C.ghostty_formatter_format_alloc(formatter, nil, &buf, &bufLen)
+	if result != C.GHOSTTY_SUCCESS {
+		return ""
+	}
+	if buf == nil {
+		return ""
+	}
+	defer C.free(unsafe.Pointer(buf))
+	return C.GoStringN((*C.char)(unsafe.Pointer(buf)), C.int(bufLen))
+}
