@@ -315,6 +315,35 @@ func (s *Server) handleControl(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("client connected: %s (%s/%s)", clientID, hello.Client.Name, hello.Client.Platform)
 
+	// Send client_connected events to all sessions (like the real Rex server does)
+	// This must happen BEFORE the bootstrap response to match real Rex behavior.
+	s.mu.RLock()
+	for _, sess := range s.sessions {
+		seq := s.nextSeq()
+		conn.WriteJSON(EventMsg{
+			Type: "event",
+			Seq:  seq,
+			Payload: map[string]interface{}{
+				"type": "session_event",
+				"payload": map[string]interface{}{
+					"session_id": sess.ID,
+					"event": map[string]interface{}{
+						"type": "client_connected",
+						"payload": map[string]interface{}{
+							"client_id": clientID,
+							"principal": map[string]interface{}{
+								"kind":      "peer",
+								"transport": "tailscale",
+								"display":   "hemlix",
+							},
+						},
+					},
+				},
+			},
+		})
+	}
+	s.mu.RUnlock()
+
 	// Step 3: Process requests
 	for {
 		_, msg, err := conn.ReadMessage()
