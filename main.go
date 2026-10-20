@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -164,8 +165,28 @@ type Block struct {
 	cmd      *exec.Cmd
 	cols     int
 	rows     int
-	dataSubs map[string]chan []byte // data_ref_id -> channel for subscribers
+	dataSubs map[string]chan []byte // subscriber ID -> channel
+	apcID    string                 // APC message ID (from data WELCOME last 8 bytes as LE uint64)
 	mu       sync.Mutex
+}
+
+// sendAPC sends a Rex APC escape sequence on the data channel
+func (b *Block) sendAPC(msgType string, payload interface{}) {
+	if b.apcID == "" {
+		return
+	}
+	data, _ := json.Marshal(payload)
+	// Format: ESC _ rex1;APC_ID;{JSON} ESC \
+	apc := fmt.Sprintf("\x1b_rex1;%s;%s\x1b\\", b.apcID, string(data))
+
+	b.mu.Lock()
+	for _, ch := range b.dataSubs {
+		select {
+		case ch <- []byte(apc):
+		default:
+		}
+	}
+	b.mu.Unlock()
 }
 
 type Client struct {
@@ -1285,6 +1306,14 @@ func (s *Server) blockMethod(req RequestMsg, client *Client) (interface{}, *RexA
 			block.cols = args.Columns
 			block.rows = args.Rows
 		}
+		// Send resize APC on data channel (like real Rex server)
+		cwpx := 7; chpx := 14
+		if args.CellWidthPx != nil { cwpx = *args.CellWidthPx }
+		if args.CellHeightPx != nil { chpx = *args.CellHeightPx }
+		block.sendAPC("resize", map[string]interface{}{
+			"type": "resize", "cols": args.Columns, "rows": args.Rows,
+			"cell_width_px": cwpx, "cell_height_px": chpx, "owner": block.Owner,
+		})
 		return map[string]interface{}{}, nil
 
 	case "com.superlogical.terminal.write":
@@ -1350,6 +1379,15 @@ func (s *Server) blockMethod(req RequestMsg, client *Client) (interface{}, *RexA
 		return map[string]interface{}{}, nil
 
 	case "com.superlogical.terminal.set_theme":
+		// Send theme APC on data channel (like real Rex server)
+		var themeArgs map[string]interface{}
+		if params.Args != nil {
+			json.Unmarshal(params.Args, &themeArgs)
+		}
+		if themeArgs != nil {
+			themeArgs["type"] = "theme"
+			block.sendAPC("theme", themeArgs)
+		}
 		return map[string]interface{}{}, nil
 
 	case "com.superlogical.terminal.list_dir":
@@ -1557,7 +1595,16 @@ func (s *Server) handleData(w http.ResponseWriter, r *http.Request) {
 	welcomeData[22] = 0xEA
 	welcomeData[23] = 0x00
 	welcomeData[24] = 0x00
-	rand.Read(welcomeData[25:32]) // extra token data
+	rand.Read(welcomeData[25:32]) // extra token data — this is also the APC ID
+
+	// Extract APC ID: last 8 bytes of WELCOME as little-endian uint64
+	apcIDBytes := welcomeData[25:33]
+	if len(apcIDBytes) < 8 { apcIDBytes = welcomeData[24:32] }
+	apcIDVal := binary.LittleEndian.Uint64(welcomeData[24:32])
+	block.mu.Lock()
+	block.apcID = fmt.Sprintf("%d", apcIDVal)
+	block.mu.Unlock()
+
 	if err := conn.WriteMessage(websocket.BinaryMessage, welcomeData); err != nil {
 		log.Printf("data: writing welcome: %v", err)
 		return
