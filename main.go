@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/rand"
+	"bytes"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
@@ -499,6 +500,73 @@ func (s *Server) handleMethod(req RequestMsg, client *Client) (interface{}, *Rex
 	case "target.complete":
 		return map[string]interface{}{"completions": []interface{}{}}, nil
 	case "block.event":
+		log.Printf("block.event payload: %s", string(req.Payload))
+		// Handle paste events from Rex.app
+		var eventParams struct {
+			SessionID string `json:"session_id"`
+			BlockID   string `json:"block_id"`
+			Event     struct {
+				Type    string          `json:"type"`
+				Payload json.RawMessage `json:"payload"`
+			} `json:"event"`
+		}
+		if req.Payload != nil {
+			json.Unmarshal(req.Payload, &eventParams)
+		}
+		if eventParams.Event.Type == "mouse" {
+			var mouse struct {
+				Action string `json:"action"`
+				Button string `json:"button"`
+				Mods   string `json:"mods"`
+				X      int    `json:"x"`
+				Y      int    `json:"y"`
+			}
+			json.Unmarshal(eventParams.Event.Payload, &mouse)
+			s.mu.RLock()
+			if sess, ok := s.sessions[eventParams.SessionID]; ok {
+				if block, ok := sess.Blocks[eventParams.BlockID]; ok {
+					if block.ptmx != nil {
+						// Map button names to SGR button codes
+						btn := 0
+						switch mouse.Button {
+						case "left": btn = 0
+						case "middle": btn = 1
+						case "right": btn = 2
+						case "unknown": btn = 35 // motion without button
+						}
+						if mouse.Action == "motion" {
+							btn += 32 // motion flag
+						}
+						// SGR encoding: [<btn;x;y M/m
+						suffix := "M"
+						if mouse.Action == "release" {
+							suffix = "m"
+						}
+						seq := fmt.Sprintf("\x1b[<%d;%d;%d%s", btn, mouse.X+1, mouse.Y+1, suffix)
+						block.ptmx.Write([]byte(seq))
+					}
+				}
+			}
+			s.mu.RUnlock()
+		} else if eventParams.Event.Type == "paste" {
+			var paste struct { Text string `json:"text"` }
+			json.Unmarshal(eventParams.Event.Payload, &paste)
+			if paste.Text != "" {
+				s.mu.RLock()
+				if sess, ok := s.sessions[eventParams.SessionID]; ok {
+					if block, ok := sess.Blocks[eventParams.BlockID]; ok {
+						if block.ptmx != nil {
+							// Send with bracketed paste mode
+							block.ptmx.Write([]byte("\x1b[200~"))
+							block.ptmx.Write([]byte(paste.Text))
+							block.ptmx.Write([]byte("\x1b[201~"))
+							log.Printf("paste: wrote %d bytes to PTY", len(paste.Text))
+						}
+					}
+				}
+				s.mu.RUnlock()
+			}
+		}
 		return map[string]interface{}{}, nil
 	case "session.new_block":
 		return s.sessionNewBlock(req, client)
@@ -527,6 +595,7 @@ func (s *Server) handleMethod(req RequestMsg, client *Client) (interface{}, *Rex
 	case "client.action":
 		return map[string]interface{}{}, nil
 	case "client.key":
+		log.Printf("client.key payload: %s", string(req.Payload))
 		return s.clientKey(req, client)
 	case "client.perform":
 		return map[string]interface{}{}, nil
@@ -638,6 +707,21 @@ func (s *Server) sessionBootstrap(req RequestMsg, client *Client) (interface{}, 
 	s.mu.RLock()
 	var selectedSession interface{}
 	for _, sess := range s.sessions {
+		// Auto-own unowned blocks for connecting client
+		for _, b := range sess.Blocks {
+			b.Owner = client.ID
+		}
+		for _, w := range sess.Windows {
+			for _, l := range w.Layers {
+				for _, br := range l.Blocks {
+					if blk, ok := sess.Blocks[br.BlockID]; ok {
+						br.Owner = blk.Owner
+						log.Printf("set block %s owner to %s", br.BlockID, br.Owner)
+					}
+				}
+			}
+		}
+
 		selectedSession = map[string]interface{}{
 			"session": map[string]string{
 				"session_id": sess.ID,
@@ -687,6 +771,21 @@ func (s *Server) sessionAttach(req RequestMsg, client *Client) (interface{}, *Re
 	}
 
 	client.AttachedSessions[params.SessionID] = true
+
+	// Auto-own unowned blocks so Rex.app opens data channel
+	for _, block := range sess.Blocks {
+		block.Owner = client.ID
+	}
+	for _, win := range sess.Windows {
+		for _, layer := range win.Layers {
+			for _, br := range layer.Blocks {
+				if blk, ok := sess.Blocks[br.BlockID]; ok {
+					br.Owner = blk.Owner
+						log.Printf("set block %s owner to %s", br.BlockID, br.Owner)
+				}
+			}
+		}
+	}
 
 	// Send client_connected event BEFORE the response (matching real Rex server).
 	// The CLI may extract client_id from this event.
@@ -970,6 +1069,8 @@ func (s *Server) createTerminalBlock(sessionID, ownerID string) *Block {
 			if n > 0 {
 				data := make([]byte, n)
 				copy(data, buf[:n])
+				// Detect OSC 52 clipboard sequences
+				detectOSC52(s, block, data)
 
 				// Feed into ghostty-vt so it maintains terminal state
 				if block.vt != nil {
@@ -1452,7 +1553,21 @@ func (s *Server) blockCreatorList() interface{} {
 						"program_status": map[string]interface{}{"description": "Return program status."},
 						"clipboard_read": map[string]interface{}{"description": "Read clipboard."},
 					},
-					"events": map[string]interface{}{},
+					"events": map[string]interface{}{
+						"bell": map[string]interface{}{},
+						"child_exited": map[string]interface{}{},
+						"clipboard_written": map[string]interface{}{},
+						"desktop_notification": map[string]interface{}{},
+						"process_changed": map[string]interface{}{},
+						"program_status_changed": map[string]interface{}{},
+						"program_status_removed": map[string]interface{}{},
+						"progress_report": map[string]interface{}{},
+						"pwd_changed": map[string]interface{}{},
+						"selection_copied": map[string]interface{}{},
+						"size_changed": map[string]interface{}{},
+						"title_changed": map[string]interface{}{},
+						"url_clicked": map[string]interface{}{},
+					},
 				},
 			},
 		},
@@ -1671,7 +1786,7 @@ func (s *Server) handleData(w http.ResponseWriter, r *http.Request) {
 				log.Printf("data: client read error: %v", err)
 				return
 			}
-			log.Printf("data: received %d bytes from client: %q", len(msg), string(msg)[:min(50, len(msg))])
+			log.Printf("DATA_INPUT: received %d bytes from client: %q", len(msg), string(msg)[:min(50, len(msg))])
 			if block.ptmx != nil && len(msg) > 0 {
 				n, err := block.ptmx.Write(msg)
 				log.Printf("data: wrote %d bytes to PTY (err=%v)", n, err)
@@ -2121,7 +2236,69 @@ func (s *Server) helpAll() interface{} {
 	}
 }
 
-// --- Main ---
+// --- M
+// detectOSC52 scans PTY output for OSC 52 clipboard sequences and sends
+// clipboard_written events on the control channel so Rex.app sets the clipboard.
+func detectOSC52(s *Server, block *Block, data []byte) {
+	// Look for OSC 52: \x1b]52;
+	prefix := []byte("\x1b]52;")
+	idx := bytes.Index(data, prefix)
+	if idx < 0 {
+		return
+	}
+	// Find the end: BEL (0x07) or ST (\x1b\\)
+	rest := data[idx+len(prefix):]
+	endBEL := bytes.IndexByte(rest, 0x07)
+	endST := bytes.Index(rest, []byte("\x1b\\"))
+	end := -1
+	if endBEL >= 0 && (endST < 0 || endBEL < endST) {
+		end = endBEL
+	} else if endST >= 0 {
+		end = endST
+	}
+	if end < 0 {
+		return
+	}
+	payload := string(rest[:end])
+	// payload is "c;BASE64" or "p;BASE64"
+	parts := strings.SplitN(payload, ";", 2)
+	if len(parts) != 2 {
+		return
+	}
+	decoded, err := base64.StdEncoding.DecodeString(parts[1])
+	if err != nil {
+		return
+	}
+	text := string(decoded)
+	log.Printf("OSC 52 clipboard: %d chars", len(text))
+	// Send clipboard_written event on control channel
+	s.broadcastSessionEvent(block.SessionID, map[string]interface{}{
+		"type": "block_event",
+		"payload": map[string]interface{}{
+			"block_id":     block.ID,
+			"creator_name": "com.superlogical.terminal",
+			"name":         "clipboard_written",
+			"payload": map[string]interface{}{
+				"text":  text,
+				"id":    0,
+				"bytes": len(text),
+			},
+		},
+	})
+	// Also send selection_copied event
+	s.broadcastSessionEvent(block.SessionID, map[string]interface{}{
+		"type": "block_event",
+		"payload": map[string]interface{}{
+			"block_id":     block.ID,
+			"creator_name": "com.superlogical.terminal",
+			"name":         "selection_copied",
+			"payload": map[string]interface{}{
+				"text": text,
+			},
+		},
+	})
+}
+
 
 func main() {
 	flag.Parse()
@@ -2194,6 +2371,12 @@ func (s *Server) clientKey(req RequestMsg, client *Client) (interface{}, *RexAPI
 	if strings.Contains(mods, "super") {
 		return map[string]interface{}{"handled": false}, nil
 	}
+
+	// Super (Cmd) keys are CLIENT-SIDE shortcuts - don't send to PTY
+	if strings.Contains(params.Key.Mods, "super") {
+		return map[string]interface{}{"handled": false}, nil
+	}
+
 
 	// Find the target block
 	s.mu.RLock()
