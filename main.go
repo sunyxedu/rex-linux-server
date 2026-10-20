@@ -1563,13 +1563,10 @@ func (s *Server) handleData(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Send the official Ghostty test fixture snapshot.
-	// Our programmatic snapshot was rejected; this one is verified by Ghostty's tests.
-	if err := conn.WriteMessage(websocket.BinaryMessage, ghosttyTestFixtureSnapshot()); err != nil {
-		log.Printf("data: writing snapshot: %v", err)
-		return
-	}
-	log.Printf("data: sent Ghostty test fixture snapshot")
+	// Don't send a Ghostty snapshot - Rex.app accepts raw VT data on the
+	// data channel without a snapshot. Sending an invalid/wrong-size snapshot
+	// causes Rex.app to destroy the session.
+	log.Printf("data: skipping snapshot, sending raw PTY data")
 
 	log.Printf("data: connected to block %s (ref: %s)", dt.BlockID, dt.DataRefID)
 
