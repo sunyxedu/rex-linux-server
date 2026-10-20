@@ -1590,19 +1590,6 @@ func (s *Server) handleData(w http.ResponseWriter, r *http.Request) {
 	block.dataSubs[subID] = dataCh
 	block.mu.Unlock()
 
-	// After subscribing, nudge the PTY to produce output so Rex.app sees activity.
-	// Send a resize (SIGWINCH) which makes the shell redraw its prompt.
-	go func() {
-		time.Sleep(100 * time.Millisecond)
-		if block.ptmx != nil {
-			if block.cols > 0 && block.rows > 0 {
-				pty.Setsize(block.ptmx, &pty.Winsize{Rows: uint16(block.rows), Cols: uint16(block.cols)})
-			}
-			// Send Enter to get a fresh prompt - subscriber is active now so output won't be lost
-			block.ptmx.Write([]byte("\n"))
-		}
-	}()
-
 	defer func() {
 		block.mu.Lock()
 		delete(block.dataSubs, subID)
