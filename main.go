@@ -1479,6 +1479,14 @@ func (s *Server) handleData(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Send a minimal Ghostty snapshot as the first data message.
+	// Rex.app expects GHOSTSNP-format terminal state before raw VT data.
+	if err := conn.WriteMessage(websocket.BinaryMessage, ghosttyMinimalSnapshot(block.cols, block.rows)); err != nil {
+		log.Printf("data: writing snapshot: %v", err)
+		return
+	}
+	log.Printf("data: sent initial Ghostty snapshot (%d cols, %d rows)", block.cols, block.rows)
+
 	log.Printf("data: connected to block %s (ref: %s)", dt.BlockID, dt.DataRefID)
 
 	// Subscribe to block output
@@ -2018,5 +2026,221 @@ func main() {
 
 	if err := http.ListenAndServe(*listenAddr, mux); err != nil {
 		log.Fatalf("listen: %v", err)
+	}
+}
+
+// ghosttyMinimalSnapshot generates a minimal valid Ghostty snapshot.
+// This is the GHOSTSNP binary format that Rex.app expects as the first
+// data message on a terminal data channel.
+func ghosttyMinimalSnapshot(cols, rows int) []byte {
+	if cols <= 0 { cols = 80 }
+	if rows <= 0 { rows = 24 }
+	
+	var buf []byte
+	
+	// Envelope: "GHOSTSNP" + version u16 LE
+	buf = append(buf, "GHOSTSNP"...)
+	buf = appendU16(buf, 1) // version
+	
+	// Terminal record (tag=1)
+	termPayload := buildTerminalPayload(cols, rows)
+	buf = appendRecord(buf, 1, termPayload)
+	
+	// Primary screen record (tag=2)
+	screenPayload := buildScreenPayload(cols, rows, 1) // key=1 for primary
+	buf = appendRecord(buf, 2, screenPayload)
+	
+	// Page record for primary screen (tag=3)
+	pagePayload := buildPagePayload(cols, rows)
+	buf = appendRecord(buf, 3, pagePayload)
+	
+	// Continuation record (tag=7) - ground state, empty
+	buf = appendRecord(buf, 7, []byte{})
+	
+	// Ready marker (tag=5)
+	buf = appendRecord(buf, 5, []byte{})
+	
+	// History for primary screen (tag=4)  
+	histPayload := buildHistoryPayload()
+	buf = appendRecord(buf, 4, histPayload)
+	
+	// Finish (tag=6)
+	buf = appendRecord(buf, 6, []byte{})
+	
+	return buf
+}
+
+func appendU16(buf []byte, v uint16) []byte {
+	return append(buf, byte(v), byte(v>>8))
+}
+
+func appendU32(buf []byte, v uint32) []byte {
+	return append(buf, byte(v), byte(v>>8), byte(v>>16), byte(v>>24))
+}
+
+func appendRecord(buf []byte, tag uint16, payload []byte) []byte {
+	// CRC32C over tag(2) + payload_len(4) + payload
+	crcData := make([]byte, 6+len(payload))
+	crcData[0] = byte(tag)
+	crcData[1] = byte(tag >> 8)
+	plen := uint32(len(payload))
+	crcData[2] = byte(plen)
+	crcData[3] = byte(plen >> 8)
+	crcData[4] = byte(plen >> 16)
+	crcData[5] = byte(plen >> 24)
+	copy(crcData[6:], payload)
+	crc := crc32c(crcData)
+	
+	buf = appendU16(buf, tag)
+	buf = appendU32(buf, plen)
+	buf = appendU32(buf, crc)
+	buf = append(buf, payload...)
+	return buf
+}
+
+// CRC32C (Castagnoli)
+func crc32c(data []byte) uint32 {
+	const poly = 0x82F63B78
+	crc := uint32(0xFFFFFFFF)
+	for _, b := range data {
+		crc ^= uint32(b)
+		for i := 0; i < 8; i++ {
+			if crc&1 != 0 {
+				crc = (crc >> 1) ^ poly
+			} else {
+				crc >>= 1
+			}
+		}
+	}
+	return crc ^ 0xFFFFFFFF
+}
+
+func buildTerminalPayload(cols, rows int) []byte {
+	var p []byte
+	
+	// Header (103 bytes based on terminal.zig)
+	p = appendU16(p, uint16(cols))    // columns
+	p = appendU16(p, uint16(rows))    // rows
+	p = appendU32(p, uint32(cols*8))  // pixel width
+	p = appendU32(p, uint32(rows*16)) // pixel height
+	p = appendU16(p, 0)              // scrolling region top
+	p = appendU16(p, uint16(rows-1)) // scrolling region bottom
+	p = appendU16(p, 0)              // scrolling region left
+	p = appendU16(p, uint16(cols-1)) // scrolling region right
+	p = append(p, 0)                 // status display
+	p = appendU16(p, 1)              // active screen key (primary=1)
+	p = appendU16(p, 1)              // screen count (just primary)
+	p = appendU32(p, 0)              // previous codepoint
+	p = append(p, 1)                 // cursor is-default
+	p = append(p, 1)                 // cursor default visual style (block)
+	p = append(p, 1)                 // cursor default blink policy
+	p = append(p, 0)                 // cursor visual style type
+	p = append(p, 0)                 // cursor actual visual style
+	p = append(p, 0)                 // cursor actual blink policy
+	p = append(p, 0, 0, 0, 0)       // cursor style color tag + padding
+	p = appendU32(p, 0)              // saved cursor x
+	p = appendU32(p, 0)              // saved cursor y
+	// More cursor/mode fields - pad to 103 bytes total
+	for len(p) < 103 {
+		p = append(p, 0)
+	}
+	
+	// Tab stops: ceil(cols/8) bytes, all set
+	tabBytes := (cols + 7) / 8
+	for i := 0; i < tabBytes; i++ {
+		p = append(p, 0) // no tab stops set
+	}
+	
+	// Original palette: 256 * 3 bytes RGB
+	// Use the standard xterm-256color palette
+	for i := 0; i < 256; i++ {
+		r, g, b := xterm256Color(i)
+		p = append(p, r, g, b)
+	}
+	
+	// Palette override mask: 32 bytes (no overrides)
+	for i := 0; i < 32; i++ {
+		p = append(p, 0)
+	}
+	// No palette overrides (mask is all zero)
+	
+	// PWD length + bytes
+	p = appendU32(p, 0) // empty pwd
+	
+	// Title length + bytes
+	p = appendU32(p, 0) // empty title
+	
+	return p
+}
+
+func buildScreenPayload(cols, rows int, key uint16) []byte {
+	var p []byte
+	// Screen header from screen.zig
+	p = appendU16(p, key)           // screen key
+	p = appendU16(p, 1)             // page count
+	p = append(p, 0, 0, 0, 0, 0, 0, 0, 0) // cursor x(u32) + cursor y(u32) = 0,0
+	p = append(p, 0)               // cursor pending wrap
+	p = append(p, 0)               // cursor origin mode
+	p = appendU16(p, 0)             // charset state
+	// Saved cursor - same format
+	p = append(p, 0, 0, 0, 0, 0, 0, 0, 0) // saved cursor x(u32) + y(u32)
+	p = append(p, 0)               // saved cursor pending wrap  
+	p = append(p, 0)               // saved cursor origin mode
+	p = appendU16(p, 0)             // saved charset state
+	// Pad to match expected size
+	for len(p) < 54 {
+		p = append(p, 0)
+	}
+	return p[:54] // exact size from test fixture
+}
+
+func buildPagePayload(cols, rows int) []byte {
+	var p []byte
+	// Page header
+	p = appendU16(p, uint16(cols)) // columns
+	p = appendU16(p, uint16(rows)) // rows (capacity)
+	p = append(p, 0, 0, 0, 0)     // flags/padding
+	p = appendU16(p, uint16(rows)) // active rows
+	// Style count, hyperlink count
+	p = appendU32(p, 0) // styles
+	p = appendU32(p, 0) // hyperlinks  
+	// Row data - empty rows
+	for i := 0; i < rows; i++ {
+		// Each row: flags(1) + cell data
+		p = append(p, 0) // row flags: not wrapped, not dirty
+	}
+	return p
+}
+
+func buildHistoryPayload() []byte {
+	var p []byte
+	// Minimal history: just header with 0 pages
+	p = appendU16(p, 1)             // screen key
+	p = appendU32(p, 0)             // page count
+	return p
+}
+
+// xterm256Color returns the RGB values for xterm-256color index
+func xterm256Color(i int) (byte, byte, byte) {
+	if i < 16 {
+		// Standard colors
+		colors := [][3]byte{
+			{0, 0, 0}, {128, 0, 0}, {0, 128, 0}, {128, 128, 0},
+			{0, 0, 128}, {128, 0, 128}, {0, 128, 128}, {192, 192, 192},
+			{128, 128, 128}, {255, 0, 0}, {0, 255, 0}, {255, 255, 0},
+			{0, 0, 255}, {255, 0, 255}, {0, 255, 255}, {255, 255, 255},
+		}
+		return colors[i][0], colors[i][1], colors[i][2]
+	} else if i < 232 {
+		// 6x6x6 color cube
+		idx := i - 16
+		r := byte((idx / 36) * 51)
+		g := byte(((idx / 6) % 6) * 51)
+		b := byte((idx % 6) * 51)
+		return r, g, b
+	} else {
+		// Grayscale
+		v := byte((i - 232) * 10 + 8)
+		return v, v, v
 	}
 }
