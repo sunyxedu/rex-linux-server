@@ -10,15 +10,19 @@ import (
 	"fmt"
 	"io"
 	"log"
+	mrand "math/rand"
 	"net/http"
 	"os"
 	"os/exec"
 	"os/user"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/creack/pty"
 	"github.com/google/uuid"
@@ -116,6 +120,9 @@ type Server struct {
 type Session struct {
 	ID      string
 	Label   string
+	// DefaultLabel is the label the server generated at creation. An empty
+	// session.set_label restores it, even if the session was created with a label.
+	DefaultLabel string
 	Windows []*Window
 	Blocks  map[string]*Block
 	revision int64
@@ -198,6 +205,10 @@ type Client struct {
 	Name      string
 	Version   string
 	AttachedSessions map[string]bool
+	// EventScope is "session" or "all" once the client calls session.bootstrap
+	// or session.attach_all. Empty means it only gets events for sessions it
+	// attached, so one-shot CLI connections don't receive unrelated events.
+	EventScope string
 	conn      *websocket.Conn
 	writeMu   sync.Mutex // protects concurrent writes to conn
 }
@@ -226,8 +237,25 @@ func NewServer() *Server {
 	}
 }
 
-// broadcastEvent sends an event to all connected clients
+// broadcastEvent sends a server-level event (session_created,
+// session_destroyed, ...) to every client that subscribed with an event scope.
 func (s *Server) broadcastEvent(event interface{}) {
+	s.sendEvent(event, func(c *Client) bool { return c.EventScope != "" })
+}
+
+// broadcastSessionEvent sends a session_event to clients that subscribed with
+// an event scope or attached to the session.
+func (s *Server) broadcastSessionEvent(sessionID string, event interface{}) {
+	s.sendEvent(map[string]interface{}{
+		"type": "session_event",
+		"payload": map[string]interface{}{
+			"session_id": sessionID,
+			"event":      event,
+		},
+	}, func(c *Client) bool { return c.EventScope != "" || c.AttachedSessions[sessionID] })
+}
+
+func (s *Server) sendEvent(event interface{}, want func(*Client) bool) {
 	seq := s.nextSeq()
 	msg := EventMsg{
 		Type:    "event",
@@ -237,20 +265,10 @@ func (s *Server) broadcastEvent(event interface{}) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	for _, c := range s.clients {
-		if c.conn != nil {
+		if c.conn != nil && want(c) {
 			c.writeJSON(msg)
 		}
 	}
-}
-
-func (s *Server) broadcastSessionEvent(sessionID string, event interface{}) {
-	s.broadcastEvent(map[string]interface{}{
-		"type": "session_event",
-		"payload": map[string]interface{}{
-			"session_id": sessionID,
-			"event":      event,
-		},
-	})
 }
 
 func (s *Server) nextSeq() int64 {
@@ -690,12 +708,13 @@ func (s *Server) sessionBootstrap(req RequestMsg, client *Client) (interface{}, 
 	if req.Payload != nil {
 		json.Unmarshal(req.Payload, &params)
 	}
-	if params.EventScope == "" {
-		return nil, &RexAPIError{Status: 400, Code: "bad_request", Message: "event_scope is required"}
+	if params.EventScope != "session" && params.EventScope != "all" {
+		return nil, &RexAPIError{Status: 400, Code: "bad_request", Message: "event_scope must be \"session\" or \"all\""}
 	}
 
 	// Mark client as attached to all sessions
 	s.mu.Lock()
+	client.EventScope = params.EventScope
 	for sid := range s.sessions {
 		client.AttachedSessions[sid] = true
 	}
@@ -746,7 +765,21 @@ func (s *Server) sessionBootstrap(req RequestMsg, client *Client) (interface{}, 
 }
 
 func (s *Server) sessionAttachAll(req RequestMsg, client *Client) (interface{}, *RexAPIError) {
+	var params struct {
+		EventScope string `json:"event_scope"`
+	}
+	if req.Payload != nil {
+		json.Unmarshal(req.Payload, &params)
+	}
+	if params.EventScope == "" {
+		params.EventScope = "session"
+	}
+	if params.EventScope != "session" && params.EventScope != "all" {
+		return nil, &RexAPIError{Status: 400, Code: "bad_request", Message: "event_scope must be \"session\" or \"all\""}
+	}
+
 	s.mu.Lock()
+	client.EventScope = params.EventScope
 	for sid := range s.sessions {
 		client.AttachedSessions[sid] = true
 	}
@@ -770,7 +803,9 @@ func (s *Server) sessionAttach(req RequestMsg, client *Client) (interface{}, *Re
 		return nil, &RexAPIError{Status: 404, Code: "not_found", Message: "session not found"}
 	}
 
+	s.mu.Lock()
 	client.AttachedSessions[params.SessionID] = true
+	s.mu.Unlock()
 
 	// Auto-own unowned blocks so Rex.app opens data channel
 	for _, block := range sess.Blocks {
@@ -940,51 +975,83 @@ func (s *Server) sessionCreate(req RequestMsg, client *Client) (interface{}, *Re
 			Layout      json.RawMessage `json:"layout"`
 		} `json:"initial_windows"`
 	}
-	if req.Payload != nil {
-		json.Unmarshal(req.Payload, &params)
+	if len(req.Payload) > 0 {
+		if err := json.Unmarshal(req.Payload, &params); err != nil {
+			return nil, badRequest("malformed session.create request: %v", err)
+		}
+	}
+	label, apiErr := normalizeLabel(params.Label)
+	if apiErr != nil {
+		return nil, apiErr
+	}
+
+	// Validate every window before starting any process, so a bad layout
+	// fails with bad_request and leaves nothing behind.
+	windowLabels := make([]string, len(params.InitialWindows))
+	specs := make([]*layoutSpec, len(params.InitialWindows))
+	for i, iw := range params.InitialWindows {
+		if windowLabels[i], apiErr = normalizeLabel(iw.WindowLabel); apiErr != nil {
+			return nil, apiErr
+		}
+		if specs[i], apiErr = parseLayout(iw.Layout); apiErr != nil {
+			return nil, apiErr
+		}
 	}
 
 	sessID := newID("session")
 	sess := &Session{
 		ID:     sessID,
-		Label:  params.Label,
 		Blocks: make(map[string]*Block),
 	}
-	if sess.Label == "" {
-		sess.Label = "Session"
-	}
 
-	var initialWindows []interface{}
+	initialWindows := make([]interface{}, 0, len(specs))
+	for i, spec := range specs {
+		root, blocks, err := s.buildLayout(sessID, client.ID, spec, [4]float64{0, 0, 1, 1})
+		if err != nil {
+			for _, b := range sess.Blocks {
+				killBlock(b)
+			}
+			return nil, &RexAPIError{Status: 500, Code: "internal", Message: fmt.Sprintf("starting window %d: %v", i+1, err)}
+		}
+		blockIDs := make([]string, 0, len(blocks))
+		for _, b := range blocks {
+			sess.Blocks[b.ID] = b
+			blockIDs = append(blockIDs, b.ID)
+		}
 
-	for _, iw := range params.InitialWindows {
-		block := s.createTerminalBlock(sessID, client.ID)
-		sess.Blocks[block.ID] = block
-
-		win, layer := s.createWindow(iw.WindowLabel, block)
+		win := s.createWindowWithLayout(windowLabels[i], root, blocks)
 		sess.Windows = append(sess.Windows, win)
-		_ = layer
-
 		sess.revision++
 
 		initialWindows = append(initialWindows, map[string]interface{}{
 			"window_id": win.ID,
-			"block_ids": []string{block.ID},
+			"block_ids": blockIDs,
 			"revision":  sess.revision,
 		})
 	}
 
-	// If no initial windows, create one default
-	if len(params.InitialWindows) == 0 {
-		block := s.createTerminalBlock(sessID, client.ID)
-		sess.Blocks[block.ID] = block
-		win, _ := s.createWindow("Window", block)
-		sess.Windows = append(sess.Windows, win)
-		sess.revision++
-	}
-
 	s.mu.Lock()
+	sess.DefaultLabel = s.generateSessionLabel()
+	sess.Label = label
+	if sess.Label == "" {
+		sess.Label = sess.DefaultLabel
+	}
 	s.sessions[sessID] = sess
 	s.mu.Unlock()
+
+	log.Printf("created session %s (%s) with %d window(s)", sessID, sess.Label, len(sess.Windows))
+
+	// session_created goes out only once every initial window is running, so
+	// no client sees a half-built session.
+	s.broadcastEvent(map[string]interface{}{
+		"type": "session_created",
+		"payload": map[string]interface{}{
+			"session": map[string]string{
+				"session_id": sessID,
+				"label":      sess.Label,
+			},
+		},
+	})
 
 	result := map[string]interface{}{
 		"session_id": sessID,
@@ -992,26 +1059,30 @@ func (s *Server) sessionCreate(req RequestMsg, client *Client) (interface{}, *Re
 	if len(initialWindows) > 0 {
 		result["initial_windows"] = initialWindows
 	}
-
-	log.Printf("created session %s (%s)", sessID, sess.Label)
-
-	// Send session_created event so Rex.app knows to attach and open the terminal
-	s.broadcastEvent(map[string]interface{}{
-		"type": "session_created",
-		"payload": map[string]interface{}{
-			"session_id": sessID,
-			"label":      sess.Label,
-		},
-	})
-
 	return result, nil
 }
 
+// createTerminalBlock starts an interactive shell block. If the shell fails
+// to start, the block is still returned, with no PTY.
 func (s *Server) createTerminalBlock(sessionID, ownerID string) *Block {
+	block, err := s.startTerminalBlock(sessionID, ownerID, "", TerminalOptions{})
+	if err != nil {
+		log.Printf("failed to start pty: %v", err)
+	}
+	return block
+}
+
+// startTerminalBlock starts a terminal block configured by opts, the
+// options_schema of com.superlogical.terminal.shell. On error the returned
+// block has no PTY.
+func (s *Server) startTerminalBlock(sessionID, ownerID, label string, opts TerminalOptions) (*Block, error) {
+	if label == "" {
+		label = "shell"
+	}
 	blockID := newID("block")
 	block := &Block{
 		ID:          blockID,
-		Label:       "shell",
+		Label:       label,
 		CreatorName: "com.superlogical.terminal",
 		Flavor:      "com.superlogical.terminal.shell",
 		SessionID:   sessionID,
@@ -1019,6 +1090,10 @@ func (s *Server) createTerminalBlock(sessionID, ownerID string) *Block {
 		cols:        80,
 		rows:        24,
 		dataSubs:    make(map[string]chan []byte),
+	}
+	if opts.Size != nil {
+		block.cols = opts.Size.Columns
+		block.rows = opts.Size.Rows
 	}
 
 	// Create a libghostty-vt terminal emulator for this block.
@@ -1030,14 +1105,16 @@ func (s *Server) createTerminalBlock(sessionID, ownerID string) *Block {
 		block.vt = vt
 	}
 
-	// Start a real shell
-	shell := os.Getenv("SHELL")
-	if shell == "" {
-		shell = "/bin/bash"
+	cmd, err := opts.command()
+	if err != nil {
+		if block.vt != nil {
+			block.vt.Free()
+			block.vt = nil
+		}
+		return block, err
 	}
-
-	cmd := exec.Command(shell, "-l")
-	cmd.Env = append(os.Environ(),
+	cmd.Dir = opts.dir()
+	cmd.Env = append(opts.environ(),
 		"TERM=xterm-256color",
 		fmt.Sprintf("REX_SESSION=%s", sessionID),
 		fmt.Sprintf("REX_BLOCK=%s", blockID),
@@ -1048,8 +1125,11 @@ func (s *Server) createTerminalBlock(sessionID, ownerID string) *Block {
 		Cols: uint16(block.cols),
 	})
 	if err != nil {
-		log.Printf("failed to start pty: %v", err)
-		return block
+		if block.vt != nil {
+			block.vt.Free()
+			block.vt = nil
+		}
+		return block, err
 	}
 
 	block.ptmx = ptmx
@@ -1101,11 +1181,21 @@ func (s *Server) createTerminalBlock(sessionID, ownerID string) *Block {
 		}
 	}()
 
-	log.Printf("started terminal block %s (shell: %s, ghostty-vt: %v)", blockID, shell, block.vt != nil)
-	return block
+	log.Printf("started terminal block %s (program: %s, ghostty-vt: %v)", blockID, cmd.Path, block.vt != nil)
+	return block, nil
 }
 
 func (s *Server) createWindow(label string, block *Block) (*Window, *Layer) {
+	win := s.createWindowWithLayout(label, &LayoutNode{
+		Rect:    [4]float64{0, 0, 1, 1},
+		BlockID: block.ID,
+	}, []*Block{block})
+	return win, win.Layers[0]
+}
+
+// createWindowWithLayout makes a window with one tiled layer that arranges
+// blocks according to root. The first block gets focus.
+func (s *Server) createWindowWithLayout(label string, root *LayoutNode, blocks []*Block) *Window {
 	winID := newID("window")
 	layerID := newID("layer")
 
@@ -1113,31 +1203,323 @@ func (s *Server) createWindow(label string, block *Block) (*Window, *Layer) {
 		label = fmt.Sprintf("Window %s", winID[len(winID)-8:])
 	}
 
-	layer := &Layer{
-		ID:   layerID,
-		Kind: "tiled",
-		Layout: &LayoutNode{
-			Rect:    [4]float64{0, 0, 1, 1},
-			BlockID: block.ID,
-		},
-		Blocks: []*BlockRef{{
-			BlockID:     block.ID,
-			Label:       block.Label,
-			CreatorName: block.CreatorName,
-			Flavor:      block.Flavor,
+	refs := make([]*BlockRef, 0, len(blocks))
+	for _, b := range blocks {
+		refs = append(refs, &BlockRef{
+			BlockID:     b.ID,
+			Label:       b.Label,
+			CreatorName: b.CreatorName,
+			Flavor:      b.Flavor,
 			HostID:      serverHostID,
-			Owner:       block.Owner,
-		}},
+			Owner:       b.Owner,
+		})
 	}
 
-	win := &Window{
+	focused := ""
+	if len(blocks) > 0 {
+		focused = blocks[0].ID
+	}
+
+	return &Window{
 		ID:             winID,
 		Label:          label,
-		FocusedBlockID: block.ID,
-		Layers:         []*Layer{layer},
+		FocusedBlockID: focused,
+		Layers: []*Layer{{
+			ID:     layerID,
+			Kind:   "tiled",
+			Layout: root,
+			Blocks: refs,
+		}},
+	}
+}
+
+func killBlock(b *Block) {
+	if b.ptmx != nil {
+		b.ptmx.Close()
+	}
+	if b.cmd != nil && b.cmd.Process != nil {
+		b.cmd.Process.Kill()
+	}
+}
+
+func badRequest(format string, args ...interface{}) *RexAPIError {
+	return &RexAPIError{Status: 400, Code: "bad_request", Message: fmt.Sprintf(format, args...)}
+}
+
+// normalizeLabel trims a session, window, or block label and checks it the
+// way the official server does: at most 128 characters, no control characters.
+func normalizeLabel(label string) (string, *RexAPIError) {
+	label = strings.TrimSpace(label)
+	if utf8.RuneCountInString(label) > 128 {
+		return "", badRequest("label is longer than 128 characters")
+	}
+	for _, r := range label {
+		if unicode.IsControl(r) {
+			return "", badRequest("label contains a control character")
+		}
+	}
+	return label, nil
+}
+
+var (
+	labelAdjectives = []string{
+		"amber", "brisk", "calm", "clear", "bright", "gentle", "golden", "hidden",
+		"lucky", "mellow", "misty", "nimble", "quiet", "rapid", "silver", "still",
+		"sunny", "swift", "tidy", "wild",
+	}
+	labelNouns = []string{
+		"canyon", "cove", "delta", "dune", "field", "forest", "glacier", "grove",
+		"harbor", "island", "lagoon", "marsh", "meadow", "orchard", "prairie",
+		"quarry", "ridge", "river", "summit", "valley",
+	}
+)
+
+// generateSessionLabel picks a label such as quiet-meadow that no live
+// session uses. Callers must hold s.mu.
+func (s *Server) generateSessionLabel() string {
+	used := make(map[string]bool, 2*len(s.sessions))
+	for _, sess := range s.sessions {
+		used[strings.ToLower(sess.Label)] = true
+		used[strings.ToLower(sess.DefaultLabel)] = true
+	}
+	for i := 0; i < 100; i++ {
+		label := labelAdjectives[mrand.Intn(len(labelAdjectives))] + "-" + labelNouns[mrand.Intn(len(labelNouns))]
+		if !used[label] {
+			return label
+		}
+	}
+	return "session-" + uuid.New().String()[:8]
+}
+
+// --- Layouts ---
+
+const terminalFlavor = "com.superlogical.terminal.shell"
+
+// layoutSpec is one node of a layout in session.create and
+// session.new_window: exactly one of Block or Split is set.
+type layoutSpec struct {
+	Block *struct {
+		Flavor  string          `json:"flavor"`
+		Label   string          `json:"label"`
+		Options json.RawMessage `json:"options"`
+	} `json:"block"`
+	Split *struct {
+		Direction string      `json:"direction"`
+		Before    *layoutSpec `json:"before"`
+		After     *layoutSpec `json:"after"`
+		Ratio     *float64    `json:"ratio"`
+	} `json:"split"`
+
+	// Filled in by validate for block nodes.
+	label string
+	opts  TerminalOptions
+}
+
+// parseLayout decodes and validates a layout. A missing or null layout means
+// one shell block.
+func parseLayout(raw json.RawMessage) (*layoutSpec, *RexAPIError) {
+	spec := &layoutSpec{}
+	if len(raw) == 0 || string(raw) == "null" {
+		spec.Block = &struct {
+			Flavor  string          `json:"flavor"`
+			Label   string          `json:"label"`
+			Options json.RawMessage `json:"options"`
+		}{Flavor: terminalFlavor}
+	} else if err := json.Unmarshal(raw, spec); err != nil {
+		return nil, badRequest("malformed layout: %v", err)
+	}
+	if apiErr := spec.validate(0); apiErr != nil {
+		return nil, apiErr
+	}
+	return spec, nil
+}
+
+func (l *layoutSpec) validate(depth int) *RexAPIError {
+	if depth > 32 {
+		return badRequest("layout is nested too deeply")
+	}
+	if (l.Block == nil) == (l.Split == nil) {
+		return badRequest("each layout node needs exactly one of block or split")
+	}
+	if b := l.Block; b != nil {
+		if b.Flavor == "" {
+			return badRequest("layout block is missing flavor")
+		}
+		if b.Flavor != terminalFlavor {
+			return &RexAPIError{Status: 404, Code: "not_found", Message: fmt.Sprintf("no block creator provides flavor %q", b.Flavor)}
+		}
+		label, apiErr := normalizeLabel(b.Label)
+		if apiErr != nil {
+			return apiErr
+		}
+		l.label = label
+		if len(b.Options) > 0 && string(b.Options) != "null" {
+			if err := json.Unmarshal(b.Options, &l.opts); err != nil {
+				return badRequest("malformed terminal options: %v", err)
+			}
+		}
+		return l.opts.validate()
+	}
+	sp := l.Split
+	if sp.Direction != "horizontal" && sp.Direction != "vertical" {
+		return badRequest("split direction must be horizontal or vertical, not %q", sp.Direction)
+	}
+	if sp.Ratio != nil && (*sp.Ratio <= 0 || *sp.Ratio >= 1) {
+		return badRequest("split ratio must be greater than 0 and less than 1")
+	}
+	if sp.Before == nil || sp.After == nil {
+		return badRequest("split needs both before and after")
+	}
+	if apiErr := sp.Before.validate(depth + 1); apiErr != nil {
+		return apiErr
+	}
+	return sp.After.validate(depth + 1)
+}
+
+// buildLayout starts the blocks of a validated layout inside rect and
+// returns the layout tree and the new blocks in depth-first order. If any
+// block fails to start, the blocks it already started are killed.
+func (s *Server) buildLayout(sessionID, ownerID string, spec *layoutSpec, rect [4]float64) (*LayoutNode, []*Block, error) {
+	if spec.Block != nil {
+		block, err := s.startTerminalBlock(sessionID, ownerID, spec.label, spec.opts)
+		if err != nil {
+			return nil, nil, err
+		}
+		return &LayoutNode{Rect: rect, BlockID: block.ID}, []*Block{block}, nil
 	}
 
-	return win, layer
+	sp := spec.Split
+	ratio := 0.5
+	if sp.Ratio != nil {
+		ratio = *sp.Ratio
+	}
+	// Rects are [x0, y0, x1, y1]. horizontal puts before on the left.
+	beforeRect, afterRect := rect, rect
+	if sp.Direction == "horizontal" {
+		mid := rect[0] + (rect[2]-rect[0])*ratio
+		beforeRect[2], afterRect[0] = mid, mid
+	} else {
+		mid := rect[1] + (rect[3]-rect[1])*ratio
+		beforeRect[3], afterRect[1] = mid, mid
+	}
+
+	first, beforeBlocks, err := s.buildLayout(sessionID, ownerID, sp.Before, beforeRect)
+	if err != nil {
+		return nil, nil, err
+	}
+	second, afterBlocks, err := s.buildLayout(sessionID, ownerID, sp.After, afterRect)
+	if err != nil {
+		for _, b := range beforeBlocks {
+			killBlock(b)
+		}
+		return nil, nil, err
+	}
+	return &LayoutNode{
+		Rect:   rect,
+		Split:  sp.Direction,
+		Ratio:  ratio,
+		First:  first,
+		Second: second,
+	}, append(beforeBlocks, afterBlocks...), nil
+}
+
+// --- Terminal options ---
+
+// TerminalOptions is the options_schema of com.superlogical.terminal.shell.
+// theme is accepted but not applied.
+type TerminalOptions struct {
+	Shell       string   `json:"shell"`
+	Command     []string `json:"command"`
+	Args        []string `json:"args"`
+	Login       *bool    `json:"login"`
+	Cwd         string   `json:"cwd"`
+	PathPrepend []string `json:"path_prepend"`
+	Size        *struct {
+		Columns int `json:"columns"`
+		Rows    int `json:"rows"`
+	} `json:"size"`
+}
+
+func (o *TerminalOptions) validate() *RexAPIError {
+	if len(o.Command) > 0 && len(o.Args) > 0 {
+		return badRequest("terminal options can't set both command and args")
+	}
+	if o.Shell == "none" && len(o.Command) == 0 {
+		return badRequest("shell \"none\" needs a command")
+	}
+	if len(o.Command) > 0 && o.Command[0] == "" {
+		return badRequest("command needs a program")
+	}
+	if o.Size != nil && (o.Size.Columns < 1 || o.Size.Columns > 65535 || o.Size.Rows < 1 || o.Size.Rows > 65535) {
+		return badRequest("terminal size must be between 1 and 65535 columns and rows")
+	}
+	return nil
+}
+
+// command builds the program the terminal runs. Without a command it starts
+// the shell as an interactive login shell, as this server always has. With a
+// command it runs the command through the shell (a login shell unless login
+// is false) so the PATH from startup files applies, passing the arguments
+// through unchanged.
+func (o *TerminalOptions) command() (*exec.Cmd, error) {
+	shell := o.Shell
+	if shell == "" {
+		shell = os.Getenv("SHELL")
+	}
+	if shell == "" {
+		shell = "/bin/bash"
+	}
+
+	if shell == "none" {
+		return exec.Command(o.Command[0], o.Command[1:]...), nil
+	}
+	if len(o.Args) > 0 {
+		return exec.Command(shell, o.Args...), nil
+	}
+
+	login := o.Login == nil || *o.Login
+	var args []string
+	if login {
+		args = append(args, "-l")
+	}
+	if len(o.Command) > 0 {
+		// "$0" "$@" hands the words to exec without the shell re-parsing them.
+		script := `exec "$0" "$@"`
+		if filepath.Base(shell) == "fish" {
+			script = "exec $argv"
+		}
+		args = append(args, "-c", script)
+		args = append(args, o.Command...)
+	}
+	return exec.Command(shell, args...), nil
+}
+
+// dir is the starting directory: cwd if it is a directory, else home.
+func (o *TerminalOptions) dir() string {
+	if o.Cwd != "" {
+		if fi, err := os.Stat(o.Cwd); err == nil && fi.IsDir() {
+			return o.Cwd
+		}
+	}
+	home, _ := os.UserHomeDir()
+	return home
+}
+
+// environ is the server's environment with path_prepend applied to PATH.
+func (o *TerminalOptions) environ() []string {
+	env := os.Environ()
+	if len(o.PathPrepend) == 0 {
+		return env
+	}
+	path := os.Getenv("PATH")
+	out := make([]string, 0, len(env)+1)
+	for _, kv := range env {
+		if !strings.HasPrefix(kv, "PATH=") {
+			out = append(out, kv)
+		}
+	}
+	parts := append(append([]string{}, o.PathPrepend...), path)
+	return append(out, "PATH="+strings.Join(parts, string(os.PathListSeparator)))
 }
 
 func (s *Server) sessionDestroy(req RequestMsg) (interface{}, *RexAPIError) {
@@ -1150,23 +1532,41 @@ func (s *Server) sessionDestroy(req RequestMsg) (interface{}, *RexAPIError) {
 
 	s.mu.Lock()
 	sess, ok := s.sessions[params.SessionID]
+	var blockIDs []string
+	var rev int64
 	if ok {
 		// Kill all blocks
 		for _, b := range sess.Blocks {
-			if b.ptmx != nil {
-				b.ptmx.Close()
-			}
-			if b.cmd != nil && b.cmd.Process != nil {
-				b.cmd.Process.Kill()
-			}
+			killBlock(b)
+			blockIDs = append(blockIDs, b.ID)
 		}
 		delete(s.sessions, params.SessionID)
+		sess.revision++
+		rev = sess.revision
 	}
 	s.mu.Unlock()
 
 	if !ok {
 		return nil, &RexAPIError{Status: 404, Code: "not_found", Message: "session not found"}
 	}
+
+	// Same order as the official server: block_closed for each block, then
+	// session_view_changed, then session_destroyed.
+	for _, id := range blockIDs {
+		s.broadcastSessionEvent(params.SessionID, map[string]interface{}{
+			"type":    "block_closed",
+			"payload": map[string]interface{}{"block_id": id},
+		})
+	}
+	s.broadcastSessionEvent(params.SessionID, map[string]interface{}{
+		"type":    "session_view_changed",
+		"payload": map[string]interface{}{"revision": rev},
+	})
+	s.broadcastEvent(map[string]interface{}{
+		"type":    "session_destroyed",
+		"payload": map[string]interface{}{"session_id": params.SessionID},
+	})
+	log.Printf("destroyed session %s", params.SessionID)
 
 	return map[string]interface{}{}, nil
 }
@@ -1182,6 +1582,15 @@ func (s *Server) sessionNewWindow(req RequestMsg, client *Client) (interface{}, 
 		json.Unmarshal(req.Payload, &params)
 	}
 
+	windowLabel, apiErr := normalizeLabel(params.WindowLabel)
+	if apiErr != nil {
+		return nil, apiErr
+	}
+	spec, apiErr := parseLayout(params.Layout)
+	if apiErr != nil {
+		return nil, apiErr
+	}
+
 	s.mu.Lock()
 	sess, ok := s.sessions[params.SessionID]
 	if !ok {
@@ -1189,10 +1598,18 @@ func (s *Server) sessionNewWindow(req RequestMsg, client *Client) (interface{}, 
 		return nil, &RexAPIError{Status: 404, Code: "not_found", Message: "session not found"}
 	}
 
-	block := s.createTerminalBlock(params.SessionID, client.ID)
-	sess.Blocks[block.ID] = block
+	root, blocks, err := s.buildLayout(params.SessionID, client.ID, spec, [4]float64{0, 0, 1, 1})
+	if err != nil {
+		s.mu.Unlock()
+		return nil, &RexAPIError{Status: 500, Code: "internal", Message: fmt.Sprintf("starting window: %v", err)}
+	}
+	blockIDs := make([]string, 0, len(blocks))
+	for _, b := range blocks {
+		sess.Blocks[b.ID] = b
+		blockIDs = append(blockIDs, b.ID)
+	}
 
-	win, _ := s.createWindow(params.WindowLabel, block)
+	win := s.createWindowWithLayout(windowLabel, root, blocks)
 	sess.Windows = append(sess.Windows, win)
 	sess.revision++
 	rev := sess.revision
@@ -1201,7 +1618,7 @@ func (s *Server) sessionNewWindow(req RequestMsg, client *Client) (interface{}, 
 	return map[string]interface{}{
 		"revision":  rev,
 		"window_id": win.ID,
-		"block_ids": []string{block.ID},
+		"block_ids": blockIDs,
 	}, nil
 }
 
@@ -1819,14 +2236,45 @@ func (s *Server) sessionSetLabel(req RequestMsg) (interface{}, *RexAPIError) {
 		Label     string `json:"label"`
 	}
 	if req.Payload != nil {
-		json.Unmarshal(req.Payload, &params)
+		if err := json.Unmarshal(req.Payload, &params); err != nil {
+			return nil, badRequest("malformed session.set_label request: %v", err)
+		}
 	}
+	label, apiErr := normalizeLabel(params.Label)
+	if apiErr != nil {
+		return nil, apiErr
+	}
+
 	s.mu.Lock()
-	if sess, ok := s.sessions[params.SessionID]; ok {
-		sess.Label = params.Label
+	sess, ok := s.sessions[params.SessionID]
+	if !ok {
+		s.mu.Unlock()
+		return nil, &RexAPIError{Status: 404, Code: "not_found", Message: "session not found"}
 	}
+	// An empty label restores the label the server generated at creation.
+	if label == "" {
+		label = sess.DefaultLabel
+	}
+	if label == sess.Label {
+		rev := sess.revision
+		s.mu.Unlock()
+		return map[string]interface{}{"revision": rev}, nil
+	}
+	sess.Label = label
+	sess.revision++
+	rev := sess.revision
 	s.mu.Unlock()
-	return map[string]interface{}{}, nil
+
+	log.Printf("session %s label -> %q", params.SessionID, label)
+	s.broadcastSessionEvent(params.SessionID, map[string]interface{}{
+		"type":    "session_label_changed",
+		"payload": map[string]interface{}{"label": label},
+	})
+	s.broadcastSessionEvent(params.SessionID, map[string]interface{}{
+		"type":    "session_view_changed",
+		"payload": map[string]interface{}{"revision": rev},
+	})
+	return map[string]interface{}{"revision": rev}, nil
 }
 
 func (s *Server) sessionSetWindowLabel(req RequestMsg) (interface{}, *RexAPIError) {
@@ -2119,22 +2567,32 @@ func (s *Server) targetResolve(req RequestMsg) (interface{}, *RexAPIError) {
 		for _, kind := range params.Kinds {
 			switch kind {
 			case "session":
-				for _, sess := range s.sessions {
-					if query == "" || query == sess.ID || query == sess.Label || matchesSuffix(sess.ID, query) {
-						results = append(results, map[string]interface{}{
-							"query":  query,
-							"status": "resolved",
-							"target": map[string]interface{}{
-								"kind":       "session",
-								"session_id": sess.ID,
-								"label":      sess.Label,
-								"where":      sess.Label,
-							},
-						})
-						resolved = true
-						break
-					}
+				matches := s.matchSessions(query, params.Context.SessionID)
+				if len(matches) == 0 {
+					break
 				}
+				targets := make([]interface{}, 0, len(matches))
+				for _, sess := range matches {
+					targets = append(targets, map[string]interface{}{
+						"kind":       "session",
+						"session_id": sess.ID,
+						"label":      sess.Label,
+					})
+				}
+				if len(targets) == 1 {
+					results = append(results, map[string]interface{}{
+						"query":  query,
+						"status": "resolved",
+						"target": targets[0],
+					})
+				} else {
+					results = append(results, map[string]interface{}{
+						"query":      query,
+						"status":     "ambiguous",
+						"candidates": targets,
+					})
+				}
+				resolved = true
 			case "window":
 				for _, sess := range s.sessions {
 					if params.Context.SessionID != "" && sess.ID != params.Context.SessionID {
@@ -2222,11 +2680,56 @@ func (s *Server) targetResolve(req RequestMsg) (interface{}, *RexAPIError) {
 	return map[string]interface{}{"results": results}, nil
 }
 
+// matchSessions finds the sessions a target.resolve query names, trying full
+// ID, then label ignoring case, then the end of an ID, and stopping at the
+// first step that matches anything. An empty query means the context session,
+// or else every session (so one session resolves and several are ambiguous).
+// Callers must hold s.mu.
+func (s *Server) matchSessions(query, contextSessionID string) []*Session {
+	query = strings.TrimSpace(query)
+	if query == "" {
+		if sess, ok := s.sessions[contextSessionID]; ok {
+			return []*Session{sess}
+		}
+		all := make([]*Session, 0, len(s.sessions))
+		for _, sess := range s.sessions {
+			all = append(all, sess)
+		}
+		return all
+	}
+	if strings.HasPrefix(query, "session:") {
+		if sess, ok := s.sessions[query]; ok {
+			return []*Session{sess}
+		}
+		return nil
+	}
+	var byLabel, bySuffix []*Session
+	for _, sess := range s.sessions {
+		if strings.EqualFold(sess.Label, query) {
+			byLabel = append(byLabel, sess)
+		} else if matchesSuffix(sess.ID, query) {
+			bySuffix = append(bySuffix, sess)
+		}
+	}
+	if len(byLabel) > 0 {
+		return byLabel
+	}
+	return bySuffix
+}
+
+// matchesSuffix reports whether query is the last 4 to 32 hexadecimal digits
+// of id, ignoring the dashes in id.
 func matchesSuffix(id, query string) bool {
 	if len(query) < 4 || len(query) > 32 {
 		return false
 	}
-	return len(id) >= len(query) && id[len(id)-len(query):] == query
+	for _, r := range query {
+		if !strings.ContainsRune("0123456789abcdefABCDEF", r) {
+			return false
+		}
+	}
+	hex := strings.ReplaceAll(id[strings.IndexByte(id, ':')+1:], "-", "")
+	return len(hex) >= len(query) && strings.EqualFold(hex[len(hex)-len(query):], query)
 }
 
 func (s *Server) helpAll() interface{} {
