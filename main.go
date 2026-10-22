@@ -17,6 +17,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -2278,11 +2279,136 @@ func (s *Server) sessionSetLabel(req RequestMsg) (interface{}, *RexAPIError) {
 }
 
 func (s *Server) sessionSetWindowLabel(req RequestMsg) (interface{}, *RexAPIError) {
-	return s.revisionResponse(req), nil
+	var params struct {
+		SessionID string  `json:"session_id"`
+		WindowID  *string `json:"window_id"`
+		Label     string  `json:"label"`
+	}
+	if req.Payload != nil {
+		if err := json.Unmarshal(req.Payload, &params); err != nil {
+			return nil, badRequest("malformed session.set_window_label request: %v", err)
+		}
+	}
+	if params.WindowID == nil || *params.WindowID == "" {
+		return nil, badRequest("window_id is required")
+	}
+	label, apiErr := normalizeLabel(params.Label)
+	if apiErr != nil {
+		return nil, apiErr
+	}
+
+	s.mu.Lock()
+	sess, ok := s.sessions[params.SessionID]
+	if !ok {
+		s.mu.Unlock()
+		return nil, &RexAPIError{Status: 404, Code: "not_found", Message: "session not found"}
+	}
+	var win *Window
+	for _, w := range sess.Windows {
+		if w.ID == *params.WindowID {
+			win = w
+			break
+		}
+	}
+	if win == nil {
+		s.mu.Unlock()
+		return nil, &RexAPIError{Status: 404, Code: "not_found", Message: "window not found"}
+	}
+	// An empty label restores the default made from the window's ID.
+	if label == "" {
+		label = fmt.Sprintf("Window %s", win.ID[len(win.ID)-8:])
+	}
+	if label == win.Label {
+		rev := sess.revision
+		s.mu.Unlock()
+		return map[string]interface{}{"revision": rev}, nil
+	}
+	win.Label = label
+	sess.revision++
+	rev := sess.revision
+	s.mu.Unlock()
+
+	log.Printf("window %s label -> %q", win.ID, label)
+	s.broadcastSessionEvent(params.SessionID, map[string]interface{}{
+		"type":    "window_label_changed",
+		"payload": map[string]interface{}{"window_id": win.ID, "label": label},
+	})
+	s.broadcastSessionEvent(params.SessionID, map[string]interface{}{
+		"type":    "session_view_changed",
+		"payload": map[string]interface{}{"revision": rev},
+	})
+	return map[string]interface{}{"revision": rev}, nil
 }
 
 func (s *Server) sessionSetBlockLabel(req RequestMsg) (interface{}, *RexAPIError) {
-	return s.revisionResponse(req), nil
+	var params struct {
+		SessionID string  `json:"session_id"`
+		BlockID   *string `json:"block_id"`
+		Label     string  `json:"label"`
+	}
+	if req.Payload != nil {
+		if err := json.Unmarshal(req.Payload, &params); err != nil {
+			return nil, badRequest("malformed session.set_block_label request: %v", err)
+		}
+	}
+	if params.BlockID == nil || *params.BlockID == "" {
+		return nil, badRequest("block_id is required")
+	}
+	label, apiErr := normalizeLabel(params.Label)
+	if apiErr != nil {
+		return nil, apiErr
+	}
+
+	s.mu.Lock()
+	sess, ok := s.sessions[params.SessionID]
+	if !ok {
+		s.mu.Unlock()
+		return nil, &RexAPIError{Status: 404, Code: "not_found", Message: "session not found"}
+	}
+	block, ok := sess.Blocks[*params.BlockID]
+	if !ok {
+		s.mu.Unlock()
+		return nil, &RexAPIError{Status: 404, Code: "not_found", Message: "block not found"}
+	}
+	// An empty label restores the default made from the block's ID, not the
+	// flavor name the block started with.
+	if label == "" {
+		label = fmt.Sprintf("Block %s", block.ID[len(block.ID)-8:])
+	}
+	if label == block.Label {
+		rev := sess.revision
+		s.mu.Unlock()
+		return map[string]interface{}{"revision": rev}, nil
+	}
+	block.Label = label
+	// The view reads labels from the block refs in each window's layers. A
+	// detached block isn't in the view, so relabeling it changes nothing there.
+	inView := false
+	for _, w := range sess.Windows {
+		for _, l := range w.Layers {
+			for _, br := range l.Blocks {
+				if br.BlockID == block.ID {
+					br.Label = label
+					inView = true
+				}
+			}
+		}
+	}
+	if !inView {
+		rev := sess.revision
+		s.mu.Unlock()
+		return map[string]interface{}{"revision": rev}, nil
+	}
+	sess.revision++
+	rev := sess.revision
+	s.mu.Unlock()
+
+	log.Printf("block %s label -> %q", block.ID, label)
+	s.broadcastSessionEvent(params.SessionID, map[string]interface{}{
+		"type":    "session_view_changed",
+		"payload": map[string]interface{}{"revision": rev},
+	})
+	return map[string]interface{}{"revision": rev}, nil
 }
 
 func (s *Server) sessionCloseWindow(req RequestMsg) (interface{}, *RexAPIError) {
@@ -2571,95 +2697,77 @@ func (s *Server) targetResolve(req RequestMsg) (interface{}, *RexAPIError) {
 				if len(matches) == 0 {
 					break
 				}
-				targets := make([]interface{}, 0, len(matches))
-				for _, sess := range matches {
-					targets = append(targets, map[string]interface{}{
-						"kind":       "session",
-						"session_id": sess.ID,
-						"label":      sess.Label,
-					})
-				}
-				if len(targets) == 1 {
-					results = append(results, map[string]interface{}{
-						"query":  query,
-						"status": "resolved",
-						"target": targets[0],
-					})
-				} else {
-					results = append(results, map[string]interface{}{
-						"query":      query,
-						"status":     "ambiguous",
-						"candidates": targets,
-					})
-				}
+				results = append(results, resolvedOrAmbiguous(query, sessionTargets(matches)))
 				resolved = true
 			case "window":
-				for _, sess := range s.sessions {
-					if params.Context.SessionID != "" && sess.ID != params.Context.SessionID {
-						continue
-					}
-					for i, win := range sess.Windows {
-						if query == "" || query == win.ID || query == win.Label || matchesSuffix(win.ID, query) {
-							results = append(results, map[string]interface{}{
-								"query":  query,
-								"status": "resolved",
-								"target": map[string]interface{}{
-									"kind":       "window",
-									"session_id": sess.ID,
-									"window_id":  win.ID,
-									"label":      win.Label,
-									"where":      fmt.Sprintf("window %d", i+1),
-									"ordinal":    i + 1,
-								},
-							})
-							resolved = true
-							break
-						}
-					}
-					if resolved {
-						break
-					}
+				sessions, failure := s.searchSessions(params.Scope.Session, params.Context.SessionID)
+				if failure != nil {
+					failure["query"] = query
+					results = append(results, failure)
+					resolved = true
+					break
 				}
+				hits, sessionChoices := matchWindows(query, sessions, params.Context.BlockID)
+				if sessionChoices != nil {
+					results = append(results, ambiguousResult(query, sessionChoices))
+					resolved = true
+					break
+				}
+				if len(hits) == 0 {
+					break
+				}
+				targets := make([]interface{}, 0, len(hits))
+				for _, h := range hits {
+					targets = append(targets, windowTarget(h, len(sessions) > 1))
+				}
+				results = append(results, resolvedOrAmbiguous(query, targets))
+				resolved = true
 			case "block":
-				for _, sess := range s.sessions {
-					if params.Context.SessionID != "" && sess.ID != params.Context.SessionID {
-						continue
-					}
-					for _, block := range sess.Blocks {
-						if query == "" || query == block.ID || query == block.Label || matchesSuffix(block.ID, query) {
-							// Find which window contains this block
-							winID := ""
-							where := "detached"
-							for wi, win := range sess.Windows {
-								for _, layer := range win.Layers {
-									for _, lb := range layer.Blocks {
-										if lb.BlockID == block.ID {
-											winID = win.ID
-											where = fmt.Sprintf("window %d", wi+1)
-										}
-									}
-								}
+				sessions, failure := s.searchSessions(params.Scope.Session, params.Context.SessionID)
+				if failure != nil {
+					failure["query"] = query
+					results = append(results, failure)
+					resolved = true
+					break
+				}
+				var scopeWindow *windowHit
+				if params.Scope.Window != "" {
+					wins, sessionChoices := matchWindows(params.Scope.Window, sessions, params.Context.BlockID)
+					if sessionChoices == nil && len(wins) == 1 {
+						scopeWindow = &wins[0]
+					} else {
+						candidates := sessionChoices
+						if candidates == nil {
+							for _, w := range wins {
+								candidates = append(candidates, windowTarget(w, len(sessions) > 1))
 							}
-							results = append(results, map[string]interface{}{
-								"query":  query,
-								"status": "resolved",
-								"target": map[string]interface{}{
-									"kind":       "block",
-									"session_id": sess.ID,
-									"window_id":  winID,
-									"block_id":   block.ID,
-									"label":      block.Label,
-									"where":      where,
-								},
-							})
-							resolved = true
-							break
 						}
-					}
-					if resolved {
+						failure := map[string]interface{}{"query": query, "status": "not_found", "reason": "scope window not found"}
+						if len(candidates) > 0 {
+							failure["status"] = "ambiguous"
+							failure["reason"] = "scope window is ambiguous"
+							failure["candidates"] = candidates
+						}
+						results = append(results, failure)
+						resolved = true
 						break
 					}
 				}
+				hits, sessionChoices := matchBlocks(query, sessions, params.Context.BlockID, scopeWindow)
+				if sessionChoices != nil {
+					results = append(results, ambiguousResult(query, sessionChoices))
+					resolved = true
+					break
+				}
+				if len(hits) == 0 {
+					break
+				}
+				targets := make([]interface{}, 0, len(hits))
+				for _, h := range hits {
+					targets = append(targets, blockTarget(h, len(sessions) > 1))
+				}
+				results = append(results, resolvedOrAmbiguous(query, targets))
+				resolved = true
 			}
 			if resolved {
 				break
@@ -2730,6 +2838,263 @@ func matchesSuffix(id, query string) bool {
 	}
 	hex := strings.ReplaceAll(id[strings.IndexByte(id, ':')+1:], "-", "")
 	return len(hex) >= len(query) && strings.EqualFold(hex[len(hex)-len(query):], query)
+}
+
+// searchSessions returns the sessions that window and block queries search:
+// the scope session if one is given, else the context session if it still
+// exists, else every session. A scope that doesn't name exactly one session
+// returns a not_found or ambiguous result instead. Callers must hold s.mu.
+func (s *Server) searchSessions(scope, contextSessionID string) ([]*Session, map[string]interface{}) {
+	if scope != "" {
+		matches := s.matchSessions(scope, contextSessionID)
+		if len(matches) == 1 {
+			return matches, nil
+		}
+		if len(matches) == 0 {
+			return nil, map[string]interface{}{"status": "not_found", "reason": "scope session not found"}
+		}
+		return nil, map[string]interface{}{
+			"status":     "ambiguous",
+			"reason":     "scope session is ambiguous",
+			"candidates": sessionTargets(matches),
+		}
+	}
+	if sess, ok := s.sessions[contextSessionID]; ok {
+		return []*Session{sess}, nil
+	}
+	all := make([]*Session, 0, len(s.sessions))
+	for _, sess := range s.sessions {
+		all = append(all, sess)
+	}
+	return all, nil
+}
+
+type windowHit struct {
+	sess *Session
+	win  *Window
+	pos  int // 1-based tab position
+}
+
+type blockHit struct {
+	sess   *Session
+	block  *Block
+	win    *Window // nil for a detached block
+	winPos int
+}
+
+// matchWindows finds the windows a query names in the order target.resolve
+// specifies: full ID, label ignoring case, tab position, then the end of an
+// ID. An empty query means the window holding contextBlockID, or else the
+// session's active window; across several sessions it returns the sessions
+// to choose from instead.
+func matchWindows(query string, sessions []*Session, contextBlockID string) ([]windowHit, []interface{}) {
+	query = strings.TrimSpace(query)
+	if query == "" {
+		if len(sessions) != 1 {
+			if len(sessions) == 0 {
+				return nil, nil
+			}
+			return nil, sessionTargets(sessions)
+		}
+		sess := sessions[0]
+		for i, w := range sess.Windows {
+			if windowHolds(w, contextBlockID) {
+				return []windowHit{{sess, w, i + 1}}, nil
+			}
+		}
+		// The active window is the last one, matching buildSessionView.
+		if n := len(sess.Windows); n > 0 {
+			return []windowHit{{sess, sess.Windows[n-1], n}}, nil
+		}
+		return nil, nil
+	}
+	var byID, byLabel, byPos, bySuffix []windowHit
+	pos, posErr := strconv.Atoi(query)
+	for _, sess := range sessions {
+		for i, w := range sess.Windows {
+			h := windowHit{sess, w, i + 1}
+			switch {
+			case w.ID == query:
+				byID = append(byID, h)
+			case strings.EqualFold(w.Label, query):
+				byLabel = append(byLabel, h)
+			case posErr == nil && pos == i+1:
+				byPos = append(byPos, h)
+			case matchesSuffix(w.ID, query):
+				bySuffix = append(bySuffix, h)
+			}
+		}
+	}
+	if strings.HasPrefix(query, "window:") {
+		return byID, nil
+	}
+	return firstNonEmpty(byID, byLabel, byPos, bySuffix), nil
+}
+
+// matchBlocks finds the blocks a query names: full ID, label ignoring case,
+// then the end of an ID. Detached blocks are included unless scopeWindow
+// limits the search to one window. An empty query means contextBlockID if it
+// is among those searched, else the focused block of the default window.
+func matchBlocks(query string, sessions []*Session, contextBlockID string, scopeWindow *windowHit) ([]blockHit, []interface{}) {
+	var all []blockHit
+	if scopeWindow != nil {
+		for _, l := range scopeWindow.win.Layers {
+			for _, br := range l.Blocks {
+				if b, ok := scopeWindow.sess.Blocks[br.BlockID]; ok {
+					all = append(all, blockHit{scopeWindow.sess, b, scopeWindow.win, scopeWindow.pos})
+				}
+			}
+		}
+	} else {
+		for _, sess := range sessions {
+			for _, b := range sess.Blocks {
+				h := blockHit{sess: sess, block: b}
+				for i, w := range sess.Windows {
+					if windowHolds(w, b.ID) {
+						h.win, h.winPos = w, i+1
+						break
+					}
+				}
+				all = append(all, h)
+			}
+		}
+	}
+
+	query = strings.TrimSpace(query)
+	if query == "" {
+		if scopeWindow == nil {
+			for _, h := range all {
+				if h.block.ID == contextBlockID {
+					return []blockHit{h}, nil
+				}
+			}
+		}
+		win := scopeWindow
+		if win == nil {
+			wins, sessionChoices := matchWindows("", sessions, contextBlockID)
+			if sessionChoices != nil || len(wins) == 0 {
+				return nil, sessionChoices
+			}
+			win = &wins[0]
+		}
+		for _, h := range all {
+			if h.sess == win.sess && h.block.ID == win.win.FocusedBlockID {
+				return []blockHit{h}, nil
+			}
+		}
+		return nil, nil
+	}
+	var byID, byLabel, bySuffix []blockHit
+	for _, h := range all {
+		switch {
+		case h.block.ID == query:
+			byID = append(byID, h)
+		case strings.EqualFold(h.block.Label, query):
+			byLabel = append(byLabel, h)
+		case matchesSuffix(h.block.ID, query):
+			bySuffix = append(bySuffix, h)
+		}
+	}
+	if strings.HasPrefix(query, "block:") {
+		return byID, nil
+	}
+	return firstNonEmpty(byID, byLabel, bySuffix), nil
+}
+
+func firstNonEmpty[T any](lists ...[]T) []T {
+	for _, l := range lists {
+		if len(l) > 0 {
+			return l
+		}
+	}
+	return nil
+}
+
+func windowHolds(w *Window, blockID string) bool {
+	if blockID == "" {
+		return false
+	}
+	for _, l := range w.Layers {
+		for _, br := range l.Blocks {
+			if br.BlockID == blockID {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func sessionTargets(sessions []*Session) []interface{} {
+	targets := make([]interface{}, 0, len(sessions))
+	for _, sess := range sessions {
+		targets = append(targets, map[string]interface{}{
+			"kind":       "session",
+			"session_id": sess.ID,
+			"label":      sess.Label,
+		})
+	}
+	return targets
+}
+
+// windowTarget describes a window; where names the session when several
+// sessions were searched.
+func windowTarget(h windowHit, manySessions bool) map[string]interface{} {
+	where := fmt.Sprintf("window %d", h.pos)
+	if manySessions {
+		where = "in " + h.sess.Label
+	}
+	return map[string]interface{}{
+		"kind":       "window",
+		"session_id": h.sess.ID,
+		"window_id":  h.win.ID,
+		"label":      h.win.Label,
+		"where":      where,
+		"ordinal":    h.pos,
+	}
+}
+
+// blockTarget describes a block; where reads "window 2" or "detached", plus
+// the session when several sessions were searched.
+func blockTarget(h blockHit, manySessions bool) map[string]interface{} {
+	t := map[string]interface{}{
+		"kind":       "block",
+		"session_id": h.sess.ID,
+		"block_id":   h.block.ID,
+		"label":      h.block.Label,
+	}
+	where := "detached"
+	if h.win != nil {
+		t["window_id"] = h.win.ID
+		where = fmt.Sprintf("window %d", h.winPos)
+	}
+	if manySessions {
+		if h.win != nil {
+			where += " of " + h.sess.Label
+		} else {
+			where += " in " + h.sess.Label
+		}
+	}
+	t["where"] = where
+	return t
+}
+
+func ambiguousResult(query string, candidates []interface{}) map[string]interface{} {
+	return map[string]interface{}{
+		"query":      query,
+		"status":     "ambiguous",
+		"candidates": candidates,
+	}
+}
+
+func resolvedOrAmbiguous(query string, targets []interface{}) map[string]interface{} {
+	if len(targets) == 1 {
+		return map[string]interface{}{
+			"query":  query,
+			"status": "resolved",
+			"target": targets[0],
+		}
+	}
+	return ambiguousResult(query, targets)
 }
 
 func (s *Server) helpAll() interface{} {
